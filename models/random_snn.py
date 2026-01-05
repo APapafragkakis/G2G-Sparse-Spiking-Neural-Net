@@ -49,8 +49,8 @@ class RandomGroupSparseLinear(nn.Module):
         out_group_size = self.out_features // self.num_groups
 
         # Base contiguous groups
-        base_in_group = torch.arange(self.in_features) // in_group_size      # [in_features]
-        base_out_group = torch.arange(self.out_features) // out_group_size   # [out_features]
+        base_in_group = torch.arange(self.in_features) // in_group_size
+        base_out_group = torch.arange(self.out_features) // out_group_size
 
         # Random permutations of neuron indices
         perm_in = torch.randperm(self.in_features)
@@ -62,8 +62,12 @@ class RandomGroupSparseLinear(nn.Module):
         in_group[perm_in] = base_in_group
         out_group[perm_out] = base_out_group
 
-        # same_group[o, i] is True if input i and output i belong to the same random group
-        same_group = (out_group[:, None] == in_group[None, :])  # [out_features, in_features]
+        # Store groups for ablation (saved in checkpoints)
+        self.register_buffer("in_group", in_group)
+        self.register_buffer("out_group", out_group)
+
+        # same_group[o, i] is True if input i and output o belong to the same random group
+        same_group = (out_group[:, None] == in_group[None, :])
 
         # Start with inter-group probability everywhere
         probs = torch.full((self.out_features, self.in_features), self.p_inter)
@@ -93,7 +97,6 @@ class RandomGroupSparseLinear(nn.Module):
                 fan_in_eff = self.in_features
             bound = 1.0 / fan_in_eff**0.5
             nn.init.uniform_(self.bias, -bound, bound)
-
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Apply sparse linear mapping with a fixed random-group mask."""
