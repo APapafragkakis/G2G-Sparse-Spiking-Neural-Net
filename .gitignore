@@ -1,13 +1,28 @@
-# datasets / large folders (do not commit)
-data/*
-!data/README.md
+# Python
+__pycache__/
+*.pyc
 
-# training artifacts
+# environments
+venv/
+
+# results/logs
+*.log
+results*/
+
+# large artifacts
 checkpoints/
 torch.Tensor
 
-# common dataset archives
+# datasets (never commit)
+data/*
+!data/README.md
+
+# archives
 *.zip
 *.tar
 *.tar.gz
 *.gz
+
+# pytorch
+*.pt
+*.pth
