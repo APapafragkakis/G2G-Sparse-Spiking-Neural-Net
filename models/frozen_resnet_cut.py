@@ -5,15 +5,15 @@ from torch import nn
 
 class FrozenTruncatedResNet(nn.Module):
     """
-    Frozen pretrained CIFAR ResNet-32 from torch.hub, truncated early to produce WEAK features.
+    Frozen pretrained CIFAR ResNet-32 from torch.hub, truncated early.
 
     Returns flattened embeddings:
       - layer1: 16 * pool_hw * pool_hw
-      - layer2: 32 * pool_hw * pool_hw   
+      - layer2: 32 * pool_hw * pool_hw
       - layer3: 64 * pool_hw * pool_hw
     """
 
-    def __init__(self, dataset: str = "cifar10", cut_at: str = "layer2", pool_hw: int = 4):
+    def __init__(self, dataset: str = "cifar10", cut_at: str = "layer1", pool_hw: int = 8):
         super().__init__()
         if dataset not in {"cifar10", "cifar100"}:
             raise ValueError(f"dataset must be 'cifar10' or 'cifar100', got {dataset}")
@@ -35,7 +35,6 @@ class FrozenTruncatedResNet(nn.Module):
         self.pool_hw = int(pool_hw)
         self.pool = nn.AdaptiveAvgPool2d((self.pool_hw, self.pool_hw))
 
-        # Freeze everything
         self.eval()
         for p in self.parameters():
             p.requires_grad = False
@@ -46,7 +45,6 @@ class FrozenTruncatedResNet(nn.Module):
         return ch * self.pool_hw * self.pool_hw
 
     def forward(self, x):
-        # x: [B, 3, 32, 32]
         x = self.stem(x)
         x = self.layer1(x)
         if self.cut_at == "layer1":
