@@ -525,6 +525,9 @@ def parse_args():
     p.add_argument("--use_resnet", action="store_true")
     p.add_argument("--enforce_sparsity", action="store_true")
     p.add_argument("--warmup_epochs", type=int, default=10)
+    p.add_argument("--use_cnn_embed", action="store_true")
+    p.add_argument("--embedding_dim", type=int, default=512)
+    p.add_argument("--conv_channels", type=int, default=32)
     return p.parse_args()
 
 
@@ -592,13 +595,13 @@ def main():
     )
     print("=" * 70)
     
+    # Build model with new arguments
     model = build_model(
         args.model,
         args.p_inter,
         args.dataset,
         use_resnet=args.use_resnet,
     ).to(device)
-
     
     # Move feature extractor to device if it exists
     if getattr(model, "feature_extractor", None) is not None:
