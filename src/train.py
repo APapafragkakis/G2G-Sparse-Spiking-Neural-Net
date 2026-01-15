@@ -178,7 +178,7 @@ def build_model(model_name: str, p_inter: float, dataset: str, use_resnet: bool)
     feature_dim = input_dim
 
     if use_resnet and dataset in ["cifar10", "cifar100"]:
-        cut_at = "layer2"
+        cut_at = "layer1"
         pool_hw = 4  # 32 * 4 * 4 = 512
 
         print(f"Loading FrozenTruncatedResNet (pretrained) for {dataset} | cut_at={cut_at} | pool_hw={pool_hw} ...")
