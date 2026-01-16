@@ -16,94 +16,98 @@ if not exist "%TRAIN%" (
 )
 
 REM =========================
-REM GLOBAL CONFIG
+REM CONFIG
 REM =========================
 set "DATASET=cifar10"
 set "T=50"
 set "BS=256"
-set "EPOCHS=50"
+set "EPOCHS=20"
 
 set "USE_RESNET=--use_resnet"
 set "SPARSEMODE=--sparsity_mode static"
 
-REM Sparse hidden dim (index/random/mixer)
-set "H_SPARSE=2048"
+REM We will run a single p_inter value
+set "P_INTER=0.90"
 
-REM p_inter sweep grid
-set "P_LIST=0 0.05 0.15 0.25 0.35 0.5 0.75"
+REM Capacity-match: keep SAME hidden_dim across dense/index/random/mixer
+set "H_CAPMATCH=488"
 
 REM Logs
-set "LOGDIR=logs_resnet_%DATASET%_T%T%_bs%BS%_e%EPOCHS%_static_capmatch_pgrid"
+set "LOGDIR=logs_sparsecapmatch_%DATASET%_T%T%_bs%BS%_e%EPOCHS%_p%P_INTER%_h%H_CAPMATCH%"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
 
 echo =====================================================
-echo START SWEEP (CIFAR10 ONLY)
+echo RUN (DENSE + INDEX + RANDOM + MIXER) @ p_inter=%P_INTER%
 echo dataset=%DATASET% epochs=%EPOCHS% T=%T% batch=%BS%
-echo p_inter grid: %P_LIST%
+echo use_resnet=YES sparsity_mode=static
+echo hidden_dim(capmatch)=%H_CAPMATCH%
 echo Logs: %LOGDIR%
 echo =====================================================
 
-for %%P in (%P_LIST%) do (
-  REM =====================================================
-  REM Dense hidden dim mapping (CAPACITY MATCH for ResNet embeddings: input_dim=512)
-  REM =====================================================
-  set "H_DENSE="
-  if "%%P"=="0"     set "H_DENSE=655"
-  if "%%P"=="0.05"  set "H_DENSE=777"
-  if "%%P"=="0.15"  set "H_DENSE=981"
-  if "%%P"=="0.25"  set "H_DENSE=1154"
-  if "%%P"=="0.35"  set "H_DENSE=1306"
-  if "%%P"=="0.5"   set "H_DENSE=1507"
-  if "%%P"=="0.75"  set "H_DENSE=1797"
+REM =========================
+REM DENSE
+REM =========================
+echo [RUN] dense (capmatch)
+%PY% "%TRAIN%" --dataset %DATASET% --model dense %USE_RESNET% %SPARSEMODE% ^
+  --p_inter %P_INTER% --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_CAPMATCH% ^
+  1> "%LOGDIR%\dense_resnet_p%P_INTER%_h%H_CAPMATCH%.log" 2>&1
 
-  if not defined H_DENSE (
-    echo [ERROR] No dense mapping for p_inter=%%P
-    pause
-    exit /b 1
-  )
+if errorlevel 1 (
+  echo [ERROR] dense failed
+  echo Check log: "%LOGDIR%\dense_resnet_p%P_INTER%_h%H_CAPMATCH%.log"
+  pause
+  exit /b 1
+)
 
-  set "PSTR=%%P"
-  set "PSTR=!PSTR:.=_!"
+REM =========================
+REM INDEX
+REM =========================
+echo [RUN] index
+%PY% "%TRAIN%" --dataset %DATASET% --model index %USE_RESNET% %SPARSEMODE% ^
+  --p_inter %P_INTER% --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_CAPMATCH% ^
+  1> "%LOGDIR%\index_resnet_p%P_INTER%_h%H_CAPMATCH%.log" 2>&1
 
-  echo.
-  echo ---- %DATASET% - p_inter=%%P - dense_h=!H_DENSE! - sparse_h=%H_SPARSE% ----
+if errorlevel 1 (
+  echo [ERROR] index failed
+  echo Check log: "%LOGDIR%\index_resnet_p%P_INTER%_h%H_CAPMATCH%.log"
+  pause
+  exit /b 1
+)
 
-  REM =========================
-  REM DENSE RUN
-  REM =========================
-  echo [RUN] dense
-  %PY% "%TRAIN%" --dataset %DATASET% --model dense %USE_RESNET% %SPARSEMODE% ^
-    --p_inter %%P --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim !H_DENSE! ^
-    1> "%LOGDIR%\dense_capmatch_p!PSTR!_h!H_DENSE!.log" 2>&1
+REM =========================
+REM RANDOM
+REM =========================
+echo [RUN] random
+%PY% "%TRAIN%" --dataset %DATASET% --model random %USE_RESNET% %SPARSEMODE% ^
+  --p_inter %P_INTER% --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_CAPMATCH% ^
+  1> "%LOGDIR%\random_resnet_p%P_INTER%_h%H_CAPMATCH%.log" 2>&1
 
-  if errorlevel 1 (
-    echo [ERROR] dense failed for dataset=%DATASET% p=%%P
-    echo Check log: %LOGDIR%\dense_capmatch_p!PSTR!_h!H_DENSE!.log
-    pause
-    exit /b 1
-  )
+if errorlevel 1 (
+  echo [ERROR] random failed
+  echo Check log: "%LOGDIR%\random_resnet_p%P_INTER%_h%H_CAPMATCH%.log"
+  pause
+  exit /b 1
+)
 
-  REM =========================
-  REM SPARSE RUNS
-  REM =========================
-  for %%M in (index random mixer) do (
-    echo [RUN] %%M
-    %PY% "%TRAIN%" --dataset %DATASET% --model %%M %USE_RESNET% %SPARSEMODE% ^
-      --p_inter %%P --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_SPARSE% ^
-      1> "%LOGDIR%\%%M_resnet_p!PSTR!_h%H_SPARSE%.log" 2>&1
+REM =========================
+REM MIXER
+REM =========================
+echo [RUN] mixer
+%PY% "%TRAIN%" --dataset %DATASET% --model mixer %USE_RESNET% %SPARSEMODE% ^
+  --p_inter %P_INTER% --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_CAPMATCH% ^
+  1> "%LOGDIR%\mixer_resnet_p%P_INTER%_h%H_CAPMATCH%.log" 2>&1
 
-    if errorlevel 1 (
-      echo [ERROR] %%M failed for dataset=%DATASET% p=%%P
-      echo Check log: %LOGDIR%\%%M_resnet_p!PSTR!_h%H_SPARSE%.log
-      pause
-      exit /b 1
-    )
-  )
+if errorlevel 1 (
+  echo [ERROR] mixer failed
+  echo Check log: "%LOGDIR%\mixer_resnet_p%P_INTER%_h%H_CAPMATCH%.log"
+  pause
+  exit /b 1
 )
 
 echo.
 echo =====================================================
-echo ALL RUNS COMPLETED SUCCESSFULLY
+echo DONE
+echo Logs folder: "%LOGDIR%"
 echo =====================================================
 pause
 endlocal
