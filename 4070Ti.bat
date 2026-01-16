@@ -26,76 +26,88 @@ set "H_SPARSE=512"
 set "USE_RESNET=--use_resnet"
 set "SPARSEMODE=--sparsity_mode dynamic"
 
-REM datasets
-set "DATASET_LIST=cifar10 cifar100"
+REM We will run a single p_inter value
+set "P_INTER=0.90"
 
-REM p' grid (χωρίς 0, 0.75, 0.9)
-set "P_LIST=0.05 0.15 0.25 0.35 0.5"
+REM Capacity-match: keep SAME hidden_dim across dense/index/random/mixer
+set "H_CAPMATCH=488"
 
-REM DST configs (3 pruning x 2 growing = 6)
-set "CP_LIST=set random hebb"
-set "CG_LIST=hebb random"
+REM Logs
+set "LOGDIR=logs_sparsecapmatch_%DATASET%_T%T%_bs%BS%_e%EPOCHS%_p%P_INTER%_h%H_CAPMATCH%"
+if not exist "%LOGDIR%" mkdir "%LOGDIR%"
 
-REM Models
-set "MODEL_LIST=index random mixer"
+echo =====================================================
+echo RUN (DENSE + INDEX + RANDOM + MIXER) @ p_inter=%P_INTER%
+echo dataset=%DATASET% epochs=%EPOCHS% T=%T% batch=%BS%
+echo use_resnet=YES sparsity_mode=static
+echo hidden_dim(capmatch)=%H_CAPMATCH%
+echo Logs: %LOGDIR%
+echo =====================================================
 
-REM =====================================================
-REM LOOP: dataset -> p -> model -> cp -> cg
-REM =====================================================
-for %%D in (%DATASET_LIST%) do (
+REM =========================
+REM DENSE
+REM =========================
+echo [RUN] dense (capmatch)
+%PY% "%TRAIN%" --dataset %DATASET% --model dense %USE_RESNET% %SPARSEMODE% ^
+  --p_inter %P_INTER% --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_CAPMATCH% ^
+  1> "%LOGDIR%\dense_resnet_p%P_INTER%_h%H_CAPMATCH%.log" 2>&1
 
-  set "DATASET=%%D"
+if errorlevel 1 (
+  echo [ERROR] dense failed
+  echo Check log: "%LOGDIR%\dense_resnet_p%P_INTER%_h%H_CAPMATCH%.log"
+  pause
+  exit /b 1
+)
 
-  REM Logs per dataset
-  set "LOGDIR=logs_dst_%%D_T%T%_bs%BS%_e%EPOCHS%_h%H_SPARSE%_pgrid_cp3_cg2"
-  if not exist "!LOGDIR!" mkdir "!LOGDIR!"
+REM =========================
+REM INDEX
+REM =========================
+echo [RUN] index
+%PY% "%TRAIN%" --dataset %DATASET% --model index %USE_RESNET% %SPARSEMODE% ^
+  --p_inter %P_INTER% --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_CAPMATCH% ^
+  1> "%LOGDIR%\index_resnet_p%P_INTER%_h%H_CAPMATCH%.log" 2>&1
 
-  echo =====================================================
-  echo START DST SWEEP for %%D
-  echo dataset=%%D epochs=%EPOCHS% T=%T% batch=%BS% hidden_dim=%H_SPARSE%
-  echo models=%MODEL_LIST%
-  echo p grid=%P_LIST%
-  echo cp=%CP_LIST%  ^|  cg=%CG_LIST%
-  echo Logs: !LOGDIR!
-  echo =====================================================
+if errorlevel 1 (
+  echo [ERROR] index failed
+  echo Check log: "%LOGDIR%\index_resnet_p%P_INTER%_h%H_CAPMATCH%.log"
+  pause
+  exit /b 1
+)
 
-  for %%P in (%P_LIST%) do (
+REM =========================
+REM RANDOM
+REM =========================
+echo [RUN] random
+%PY% "%TRAIN%" --dataset %DATASET% --model random %USE_RESNET% %SPARSEMODE% ^
+  --p_inter %P_INTER% --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_CAPMATCH% ^
+  1> "%LOGDIR%\random_resnet_p%P_INTER%_h%H_CAPMATCH%.log" 2>&1
 
-    set "PSTR=%%P"
-    set "PSTR=!PSTR:.=_!"
+if errorlevel 1 (
+  echo [ERROR] random failed
+  echo Check log: "%LOGDIR%\random_resnet_p%P_INTER%_h%H_CAPMATCH%.log"
+  pause
+  exit /b 1
+)
 
-    echo.
-    echo ===============================
-    echo Dataset=%%D   p_inter=%%P
-    echo ===============================
+REM =========================
+REM MIXER
+REM =========================
+echo [RUN] mixer
+%PY% "%TRAIN%" --dataset %DATASET% --model mixer %USE_RESNET% %SPARSEMODE% ^
+  --p_inter %P_INTER% --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_CAPMATCH% ^
+  1> "%LOGDIR%\mixer_resnet_p%P_INTER%_h%H_CAPMATCH%.log" 2>&1
 
-    for %%M in (%MODEL_LIST%) do (
-      for %%CP in (%CP_LIST%) do (
-        for %%CG in (%CG_LIST%) do (
-
-          echo [RUN] %%D %%M p=%%P cp=%%CP cg=%%CG
-
-          %PY% "%TRAIN%" --dataset %%D --model %%M %USE_RESNET% %SPARSEMODE% ^
-            --p_inter %%P --cp %%CP --cg %%CG ^
-            --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_SPARSE% ^
-            1> "!LOGDIR!\%%M_dst_p!PSTR!_cp%%CP_cg%%CG_h%H_SPARSE%.log" 2>&1
-
-          if errorlevel 1 (
-            echo [ERROR] FAILED: dataset=%%D model=%%M p=%%P cp=%%CP cg=%%CG
-            echo Check log: "!LOGDIR!\%%M_dst_p!PSTR!_cp%%CP_cg%%CG_h%H_SPARSE%.log"
-            pause
-            exit /b 1
-          )
-
-        )
-      )
-    )
-  )
+if errorlevel 1 (
+  echo [ERROR] mixer failed
+  echo Check log: "%LOGDIR%\mixer_resnet_p%P_INTER%_h%H_CAPMATCH%.log"
+  pause
+  exit /b 1
 )
 
 echo.
 echo =====================================================
-echo ALL DST RUNS COMPLETED SUCCESSFULLY
+echo DONE
+echo Logs folder: "%LOGDIR%"
 echo =====================================================
 pause
 endlocal
