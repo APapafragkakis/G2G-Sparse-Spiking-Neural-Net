@@ -44,8 +44,6 @@ REM LOOP: dataset -> p -> model -> cp -> cg
 REM =====================================================
 for %%D in (%DATASET_LIST%) do (
 
-  set "DATASET=%%D"
-
   REM Logs per dataset
   set "LOGDIR=logs_dst_%%D_T%T%_bs%BS%_e%EPOCHS%_h%H_SPARSE%_pgrid_cp3_cg2"
   if not exist "!LOGDIR!" mkdir "!LOGDIR!"
@@ -70,19 +68,19 @@ for %%D in (%DATASET_LIST%) do (
     echo ===============================
 
     for %%M in (%MODEL_LIST%) do (
-      for %%CP in (%CP_LIST%) do (
-        for %%CG in (%CG_LIST%) do (
+      for %%C in (%CP_LIST%) do (
+        for %%G in (%CG_LIST%) do (
 
-          echo [RUN] %%D %%M p=%%P cp=%%CP cg=%%CG
+          echo [RUN] %%D %%M p=%%P cp=%%C cg=%%G
 
           %PY% "%TRAIN%" --dataset %%D --model %%M %USE_RESNET% %SPARSEMODE% ^
-            --p_inter %%P --cp %%CP --cg %%CG ^
+            --p_inter %%P --cp %%C --cg %%G ^
             --epochs %EPOCHS% --T %T% --batch_size %BS% --hidden_dim %H_SPARSE% ^
-            1> "!LOGDIR!\%%M_dst_p!PSTR!_cp%%CP_cg%%CG_h%H_SPARSE%.log" 2>&1
+            1> "!LOGDIR!\%%M_dst_p!PSTR!_cp%%C_cg%%G_h%H_SPARSE%.log" 2>&1
 
           if errorlevel 1 (
-            echo [ERROR] FAILED: dataset=%%D model=%%M p=%%P cp=%%CP cg=%%CG
-            echo Check log: "!LOGDIR!\%%M_dst_p!PSTR!_cp%%CP_cg%%CG_h%H_SPARSE%.log"
+            echo [ERROR] FAILED: dataset=%%D model=%%M p=%%P cp=%%C cg=%%G
+            echo Check log: "!LOGDIR!\%%M_dst_p!PSTR!_cp%%C_cg%%G_h%H_SPARSE%.log"
             pause
             exit /b 1
           )
