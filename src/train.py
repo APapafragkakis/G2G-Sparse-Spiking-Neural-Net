@@ -509,17 +509,23 @@ def compute_firing_rates(model, loader, device):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train SNN models on multiple datasets.")
-    p.add_argument("--dataset", type=str, default="fashionmnist", choices=["fashionmnist", "cifar10", "cifar100"])
-    p.add_argument("--model", type=str, default="dense", choices=["dense", "index", "random", "mixer"])
+    p.add_argument("--dataset", type=str, default="fashionmnist", 
+                   choices=["fashionmnist", "cifar10", "cifar100"])
+    p.add_argument("--model", type=str, default="dense", 
+                   choices=["dense", "index", "random", "mixer"])
     p.add_argument("--epochs", type=int, default=num_epochs)
     p.add_argument("--p_inter", type=float, default=0.15)
-    p.add_argument("--sparsity_mode", type=str, default="static", choices=["static", "dynamic"])
-    p.add_argument("--cp", type=str, default="set", choices=["set", "random", "hebb"])
-    p.add_argument("--cg", type=str, default="hebb", choices=["hebb", "random"])
+    p.add_argument("--sparsity_mode", type=str, default="static", 
+                   choices=["static", "dynamic"])
+    p.add_argument("--cp", type=str, default="set", 
+                   choices=["set", "random", "hebb"])
+    p.add_argument("--cg", type=str, default="hebb", 
+                   choices=["hebb", "random"])
     p.add_argument("--T", type=int, default=T)
     p.add_argument("--batch_size", type=int, default=batch_size)
     p.add_argument("--hidden_dim", type=int, default=hidden_dim)
-    p.add_argument("--enc", type=str, default="current", choices=["current", "rate"])
+    p.add_argument("--enc", type=str, default="current", 
+                   choices=["current", "rate"])
     p.add_argument("--enc_scale", type=float, default=1.0)
     p.add_argument("--enc_bias", type=float, default=0.0)
     p.add_argument("--use_resnet", action="store_true")
@@ -528,6 +534,18 @@ def parse_args():
     p.add_argument("--use_cnn_embed", action="store_true")
     p.add_argument("--embedding_dim", type=int, default=512)
     p.add_argument("--conv_channels", type=int, default=32)
+    p.add_argument("--resnet_connectivity", type=str, default="dense",
+                   choices=["dense", "degree"],
+                   help="dense: normal conv channels, degree: degree-controlled channel connectivity")
+    p.add_argument("--resnet_k_in", type=int, default=8,
+                   help="K input-channels per output-channel when resnet_connectivity=degree")
+    p.add_argument("--resnet_degree_mode", type=str, default="exact",
+                   choices=["exact", "max"],
+                   help="exact: exactly K connections, max: at most K connections")
+    p.add_argument("--resnet_mask_scope", type=str, default="all",
+                   choices=["all", "layer1", "layer2", "layer3", "stem"],
+                   help="Where to apply degree masking")
+
     return p.parse_args()
 
 
