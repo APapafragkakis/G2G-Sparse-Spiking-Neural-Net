@@ -533,7 +533,11 @@ def parse_args():
     p.add_argument("--use_cnn_embed", action="store_true")
     p.add_argument("--embedding_dim", type=int, default=512)
     p.add_argument("--conv_channels", type=int, default=32)
-    
+    p.add_argument("--resnet_cardinality", type=int, default=4,
+               help="Number of groups in grouped conv (ResNeXt cardinality)")
+    p.add_argument("--resnet_width_per_group", type=int, default=4,
+               help="Width per group for bottleneck: D = cardinality * width_per_group")
+
 
     return p.parse_args()
 
