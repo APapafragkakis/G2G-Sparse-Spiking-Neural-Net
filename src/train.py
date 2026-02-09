@@ -12,6 +12,7 @@ from models.dense_snn import DenseSNN
 from models.index_snn import IndexSNN, IndexSparseLinear
 from models.random_snn import RandomSNN, RandomGroupSparseLinear
 from models.mixer_snn import MixerSNN, MixerSparseLinear
+from models.ks32_grouped import KS32GroupedEmbedder
 
 from data.fashionmnist import get_fashion_loaders
 from data.cifar10_100 import get_cifar10_loaders, get_cifar100_loaders
