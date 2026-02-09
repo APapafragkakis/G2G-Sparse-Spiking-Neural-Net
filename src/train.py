@@ -533,17 +533,7 @@ def parse_args():
     p.add_argument("--use_cnn_embed", action="store_true")
     p.add_argument("--embedding_dim", type=int, default=512)
     p.add_argument("--conv_channels", type=int, default=32)
-    p.add_argument("--resnet_connectivity", type=str, default="dense",
-                   choices=["dense", "degree"],
-                   help="dense: normal conv channels, degree: degree-controlled channel connectivity")
-    p.add_argument("--resnet_k_in", type=int, default=8,
-                   help="K input-channels per output-channel when resnet_connectivity=degree")
-    p.add_argument("--resnet_degree_mode", type=str, default="exact",
-                   choices=["exact", "max"],
-                   help="exact: exactly K connections, max: at most K connections")
-    p.add_argument("--resnet_mask_scope", type=str, default="all",
-                   choices=["all", "layer1", "layer2", "layer3", "stem"],
-                   help="Where to apply degree masking")
+    
 
     return p.parse_args()
 
