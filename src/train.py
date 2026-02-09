@@ -181,7 +181,13 @@ def build_model(model_name: str, p_inter: float, dataset: str, use_resnet: bool)
         pool_hw = 4  # 32 * 4 * 4 = 512
 
         print(f"Loading FrozenTruncatedResNet (pretrained) for {dataset} | cut_at={cut_at} | pool_hw={pool_hw} ...")
-        feature_extractor = FrozenTruncatedResNet(dataset=dataset, cut_at=cut_at, pool_hw=pool_hw)
+        feature_extractor = FrozenTruncatedResNet(
+        dataset=dataset,
+        cut_at=cut_at,
+        pool_hw=pool_hw,
+        cardinality=args.resnet_cardinality,
+        width_per_group=args.resnet_width_per_group,
+    )
         feature_dim = feature_extractor.out_dim  # 512
         print(f"FrozenTruncatedResNet ready. feature_dim={feature_dim}")
 
