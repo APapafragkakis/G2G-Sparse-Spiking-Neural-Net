@@ -172,7 +172,7 @@ def load_checkpoint(model, optimizer, args):
         return 1
 
 
-def build_model(model_name: str, p_inter: float, dataset: str, use_resnet: bool):
+def build_model(model_name, p_inter, dataset, use_resnet, args):
     feature_extractor = None
     feature_dim = input_dim
 
@@ -612,13 +612,8 @@ def main():
     )
     print("=" * 70)
     
-    # Build model with new arguments
-    model = build_model(
-        args.model,
-        args.p_inter,
-        args.dataset,
-        use_resnet=args.use_resnet,
-    ).to(device)
+    # Build model 
+    model = build_model(args.model, args.p_inter, args.dataset, use_resnet=args.use_resnet, args=args).to(device)
     
     # Move feature extractor to device if it exists
     if getattr(model, "feature_extractor", None) is not None:
