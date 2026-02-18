@@ -13,6 +13,12 @@ from models.index_snn import IndexSNN, IndexSparseLinear
 from models.random_snn import RandomSNN, RandomGroupSparseLinear
 from models.mixer_snn import MixerSNN, MixerSparseLinear
 from models.ks32_grouped import KS32GroupedEmbedder
+from conv_edge_pruning import (
+    wrap_conv2d_with_edge_masks_,
+    pre_training_prune_model_,
+    dynamic_pruning_step_model_,
+    post_training_prune_model_,
+)
 
 from data.fashionmnist import get_fashion_loaders
 from data.cifar10_100 import get_cifar10_loaders, get_cifar100_loaders
@@ -368,168 +374,10 @@ def _make_input_sequence(images, device, model, return_embeddings: bool = False)
         return x_seq, None
     return x_seq
 
-# -----------------------------
-# Conv edge pruning (channel-level) utilities
-# edges: c -> c'  (kernel W[c', c, :, :])
-# -----------------------------
-
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
-
-class ChannelMaskedConv2d(nn.Module):
-    """
-    Wraps an nn.Conv2d and applies a channel-edge mask [C_out, C_in].
-    Effective weight: W_eff = W * mask[:, :, None, None]
-    Supports groups == 1 only.
-    """
-    def __init__(self, conv: nn.Conv2d):
-        super().__init__()
-        if not isinstance(conv, nn.Conv2d):
-            raise TypeError("ChannelMaskedConv2d expects nn.Conv2d")
-        if conv.groups != 1:
-            raise NotImplementedError("Only groups==1 supported for now.")
-        self.conv = conv
-        self.register_buffer("mask", torch.ones(conv.out_channels, conv.in_channels, dtype=torch.float32))
-
-    def forward(self, x):
-        w_eff = self.conv.weight * self.mask[:, :, None, None]
-        return nn.functional.conv2d(
-            x, w_eff, self.conv.bias,
-            stride=self.conv.stride, padding=self.conv.padding,
-            dilation=self.conv.dilation, groups=self.conv.groups
-        )
-
-    @property
-    def weight(self):
-        return self.conv.weight
-
-
-def iter_masked_convs(model: nn.Module) -> Iterable[Tuple[str, ChannelMaskedConv2d]]:
-    for name, m in model.named_modules():
-        if isinstance(m, ChannelMaskedConv2d):
-            yield name, m
-
-
-def wrap_conv2d_with_edge_masks_(model: nn.Module, include_names: Optional[List[str]] = None) -> nn.Module:
-    """
-    In-place replace eligible nn.Conv2d with ChannelMaskedConv2d.
-    include_names: if provided, wrap only modules whose full name contains any substring in list.
-    """
-    def should_wrap(full_name: str, module: nn.Module) -> bool:
-        if not isinstance(module, nn.Conv2d):
-            return False
-        if module.groups != 1:
-            return False
-        if include_names is None:
-            return True
-        return any(s in full_name for s in include_names)
-
-    for parent_name, parent in model.named_modules():
-        for child_name, child in list(parent.named_children()):
-            full = f"{parent_name}.{child_name}".lstrip(".")
-            if should_wrap(full, child):
-                setattr(parent, child_name, ChannelMaskedConv2d(child))
-    return model
-
-
-@torch.no_grad()
-def init_random_sparsity_(layer: ChannelMaskedConv2d, sparsity: float, generator: Optional[torch.Generator] = None):
-    if not (0.0 <= sparsity < 1.0):
-        raise ValueError("sparsity must be in [0,1)")
-    total = layer.mask.numel()
-    num_prune = int(round(sparsity * total))
-    layer.mask.fill_(1.0)
-    if num_prune <= 0:
-        return
-    perm = torch.randperm(total, generator=generator, device=layer.mask.device)
-    layer.mask.view(-1)[perm[:num_prune]] = 0.0
-
-
-@torch.no_grad()
-def edge_importance_l1(layer: ChannelMaskedConv2d) -> torch.Tensor:
-    # [C_out, C_in]
-    return layer.weight.abs().sum(dim=(2, 3))
-
-
-@torch.no_grad()
-def prune_low_importance_active_(layer: ChannelMaskedConv2d, prune_frac: float) -> int:
-    if prune_frac <= 0:
-        return 0
-    m = layer.mask
-    active = m.bool()
-    n_active = int(active.sum().item())
-    if n_active == 0:
-        return 0
-    n_prune = int(prune_frac * n_active)
-    if n_prune < 1:
-        return 0
-
-    imp = edge_importance_l1(layer)
-    active_imp = imp[active].view(-1)
-    k = min(n_prune, active_imp.numel())
-    thr, _ = torch.kthvalue(active_imp, k)
-    to_prune = (imp <= thr) & active
-
-    pruned = int(to_prune.sum().item())
-    m[to_prune] = 0.0
-    return pruned
-
-
-@torch.no_grad()
-def rewire_random_inactive_(layer: ChannelMaskedConv2d, num_to_grow: int, generator: Optional[torch.Generator] = None) -> int:
-    if num_to_grow <= 0:
-        return 0
-    m = layer.mask
-    inactive = (~m.bool())
-    idx = inactive.nonzero(as_tuple=False)
-    if idx.numel() == 0:
-        return 0
-    n = min(num_to_grow, idx.size(0))
-    perm = torch.randperm(idx.size(0), generator=generator, device=m.device)[:n]
-    grow = idx[perm]
-    m[grow[:, 0], grow[:, 1]] = 1.0
-    return int(n)
-
-
-@torch.no_grad()
-def dynamic_prune_and_rewire_(layer: ChannelMaskedConv2d, prune_frac: float, generator: Optional[torch.Generator] = None) -> Dict[str, int]:
-    pruned = prune_low_importance_active_(layer, prune_frac)
-    grown = rewire_random_inactive_(layer, pruned, generator=generator)
-    return {"pruned": pruned, "grown": grown}
-
-
-@torch.no_grad()
-def pre_training_prune_model_(model: nn.Module, sparsity: float, seed: Optional[int] = None):
-    for name, layer in iter_masked_convs(model):
-        g = None
-        if seed is not None:
-            g = torch.Generator(device=layer.mask.device)
-            g.manual_seed(abs(hash((seed, name, "pre"))) % (2**31))
-        init_random_sparsity_(layer, sparsity, generator=g)
-
-
-@torch.no_grad()
-def dynamic_pruning_step_model_(model: nn.Module, prune_frac: float, seed: Optional[int] = None) -> Dict[str, Dict[str, int]]:
-    out = {}
-    for name, layer in iter_masked_convs(model):
-        g = None
-        if seed is not None:
-            g = torch.Generator(device=layer.mask.device)
-            g.manual_seed(abs(hash((seed, name, "dyn"))) % (2**31))
-        out[name] = dynamic_prune_and_rewire_(layer, prune_frac, generator=g)
-    return out
-
-
-@torch.no_grad()
-def post_training_prune_model_(model: nn.Module, prune_frac_of_active: float) -> Dict[str, int]:
-    out = {}
-    for name, layer in iter_masked_convs(model):
-        out[name] = prune_low_importance_active_(layer, prune_frac_of_active)
-    return out
-
-
-def train_one_epoch(model, loader, optimizer, device, epoch_idx, use_dst, 
-                   enforce_sparsity=False, lambda_coef=0.0, target_rate=0.09):
+def train_one_epoch(
+    model, loader, optimizer, device, epoch_idx, use_dst,
+    enforce_sparsity=False, lambda_coef=0.0, target_rate=0.09,
+    conv_target=None, conv_dyn_prune_frac=0.0, conv_update_interval=1000):
     """
     Train for one epoch. Simplified to always use CrossEntropy on spk_sum.
     """
@@ -594,7 +442,11 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, use_dst,
         
         loss.backward()
         optimizer.step()
-        
+        # Conv dynamic prune + random rewiring (keeps sparsity constant)
+        if conv_target is not None and conv_dyn_prune_frac > 0.0:
+            if global_step > 0 and (global_step % conv_update_interval == 0):
+                dynamic_pruning_step_model_(conv_target, conv_dyn_prune_frac)
+
         # Dynamic Sparse Training step
         if use_dst and isinstance(model, SPARSE_MODEL_TYPES):
             if global_step > 0 and global_step % UPDATE_INTERVAL == 0:
@@ -707,13 +559,13 @@ def parse_args():
                    choices=["none", "feature_extractor", "all"],
                    help="Where to apply conv edge pruning.")
     p.add_argument("--conv_init_sparsity", type=float, default=0.0,
-                   help="Pre-training random sparsity S0 for conv edges. (0.0 disables)")
+                   help="Pre-training random sparsity S0 for conv edges (0 disables).")
     p.add_argument("--conv_dyn_prune_frac", type=float, default=0.0,
-                   help="Dynamic pruning fraction of ACTIVE edges to prune at each update. (0.0 disables)")
+                   help="Dynamic prune fraction of ACTIVE edges at each update (0 disables).")
     p.add_argument("--conv_update_interval", type=int, default=1000,
-                   help="How many iterations between dynamic prune+rewire steps.")
+                   help="Iterations between dynamic prune+rewire steps.")
     p.add_argument("--conv_post_prune_frac", type=float, default=0.0,
-                   help="Post-training pruning fraction of ACTIVE edges to prune after training. (0.0 disables)")
+                   help="Post-training prune fraction of ACTIVE edges (0 disables).")
     p.add_argument("--conv_finetune_epochs", type=int, default=0,
                    help="Extra epochs to fine-tune after post-training pruning.")
     return p.parse_args()
@@ -723,14 +575,14 @@ def parse_args():
 def main():
     args = parse_args()
     done_marker = get_done_marker_path(args)
-    
+
     if os.path.exists(done_marker):
         print("[DONE] This experiment already finished. Skipping.")
         print(f"[INFO] To re-run, delete: {done_marker}")
         return
-    
+
     device = select_device()
-    
+
     # Update global variables
     global cp_mode, cg_mode, T, batch_size, hidden_dim
     cp_mode = args.cp
@@ -738,16 +590,16 @@ def main():
     T = args.T
     batch_size = args.batch_size
     hidden_dim = args.hidden_dim
-    
+
     global enc_mode, enc_scale, enc_bias
     enc_mode = args.enc
     enc_scale = float(args.enc_scale)
     enc_bias = float(args.enc_bias)
-    
+
     global input_dim, num_classes
-    
+
     normalize_images = bool(args.use_resnet and not args.use_cnn_embed)
-    
+
     # Load data
     if args.dataset == "fashionmnist":
         input_dim = 28 * 28
@@ -761,20 +613,20 @@ def main():
         input_dim = 3 * 32 * 32
         num_classes = 100
         train_loader, test_loader = get_cifar100_loaders(batch_size, normalize=normalize_images)
-    
+
     # Print configuration
     num_groups = 8 if args.model in ["index", "random", "mixer"] else "N/A"
-    
+
     if args.use_cnn_embed:
         feature_str = f"CNN-1L (ch={args.conv_channels}, emb={args.embedding_dim})"
     elif args.use_resnet:
         feature_str = "ResNet-32 (frozen)"
     else:
         feature_str = "Direct"
-    
+
     inject_str = "raw" if (args.use_resnet or args.use_cnn_embed) else enc_mode
     norm_str = "normalized" if normalize_images else "raw [0,1]"
-    
+
     print(
         f"[CONFIG] dataset={args.dataset} | model={args.model} | feature_extract={feature_str} | "
         f"preprocessing={norm_str} | inject={inject_str} | "
@@ -782,27 +634,44 @@ def main():
         f"batch={batch_size} | hidden_dim={hidden_dim} | groups={num_groups} | p_inter={args.p_inter}"
     )
     print("=" * 70)
-    
-    # Build model 
-    model = build_model(args.model, args.p_inter, args.dataset, use_resnet=args.use_resnet, args=args).to(device)
-    
-    # Move feature extractor to device if it exists
+
+    # ---------------- Build model ----------------
+    model = build_model(
+        args.model, args.p_inter, args.dataset,
+        use_resnet=args.use_resnet, args=args
+    ).to(device)
+
+    # Move feature extractor to device if it exists (IMPORTANT: do this BEFORE wrapping)
     if getattr(model, "feature_extractor", None) is not None:
         model.feature_extractor = model.feature_extractor.to(device)
-    
-    # Get trainable parameters
+
+    # ---------------- Conv edge pruning (wrap + pre-prune) ----------------
+    conv_target = None
+    if args.conv_prune_scope == "feature_extractor":
+        conv_target = getattr(model, "feature_extractor", None)
+    elif args.conv_prune_scope == "all":
+        conv_target = model
+
+    if conv_target is not None and args.conv_prune_scope != "none":
+        wrap_conv2d_with_edge_masks_(conv_target)
+
+        if args.conv_init_sparsity > 0.0:
+            pre_training_prune_model_(conv_target, args.conv_init_sparsity)
+            print(f"[ConvPrune] Pre-training init sparsity S0={args.conv_init_sparsity:.2f}")
+
+    # ---------------- Optimizer ----------------
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
-    
+
     use_dst = (args.sparsity_mode == "dynamic")
     start_epoch = load_checkpoint(model, optimizer, args)
-    
+
     if start_epoch > 1:
         model = model.to(device)
-    
+
     last_completed_epoch = start_epoch - 1
-    
-    # Training loop
+
+    # ---------------- Training loop ----------------
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             if args.enforce_sparsity:
@@ -813,50 +682,71 @@ def main():
                     print(f"[Sparsity] lambda={lambda_coef:.6f}, target_rate={target_rate:.4f}")
             else:
                 lambda_coef, target_rate = 0.0, 0.09
-            
+
             train_acc = train_one_epoch(
-                model, train_loader, optimizer, device, epoch, 
-                use_dst, args.enforce_sparsity, lambda_coef, target_rate
+                model, train_loader, optimizer, device, epoch,
+                use_dst, args.enforce_sparsity, lambda_coef, target_rate,
+                conv_target=conv_target,
+                conv_dyn_prune_frac=args.conv_dyn_prune_frac,
+                conv_update_interval=args.conv_update_interval,
             )
             test_acc = evaluate(model, test_loader, device)
-            
+
             print(f"Epoch {epoch:02d} | train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
-            
+
             last_completed_epoch = epoch
             save_checkpoint(epoch, model, optimizer, args, {'train_acc': train_acc, 'test_acc': test_acc})
-    
+
     except KeyboardInterrupt:
         print("\n[Training interrupted by user - checkpoint saved]")
         if last_completed_epoch >= start_epoch:
             save_checkpoint(last_completed_epoch, model, optimizer, args)
         return
-    
+
     except Exception as e:
         print(f"\n[ERROR] Training failed: {e}")
         if last_completed_epoch >= start_epoch:
             save_checkpoint(last_completed_epoch, model, optimizer, args)
         raise
-    
-    # Final evaluation
+
+    # ---------------- Conv post-training pruning + optional fine-tune ----------------
+    if conv_target is not None and args.conv_post_prune_frac > 0.0:
+        pruned = post_training_prune_model_(conv_target, args.conv_post_prune_frac)
+        print(f"[ConvPrune] Post-training prune frac={args.conv_post_prune_frac:.2f} | pruned_total={sum(pruned.values())}")
+
+        if args.conv_finetune_epochs > 0:
+            print(f"[ConvPrune] Fine-tuning for {args.conv_finetune_epochs} epochs (fixed masks, no rewiring)...")
+            for ft in range(1, args.conv_finetune_epochs + 1):
+                ft_epoch = args.epochs + ft
+
+                train_acc = train_one_epoch(
+                    model, train_loader, optimizer, device, ft_epoch,
+                    use_dst, args.enforce_sparsity, lambda_coef, target_rate,
+                    conv_target=conv_target,
+                    conv_dyn_prune_frac=0.0,  # IMPORTANT: no rewiring in fine-tune
+                    conv_update_interval=args.conv_update_interval,
+                )
+                test_acc = evaluate(model, test_loader, device)
+                print(f"[FineTune {ft:02d}] train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
+
+                save_checkpoint(ft_epoch, model, optimizer, args, {'train_acc': train_acc, 'test_acc': test_acc})
+
+    # ---------------- Final evaluation ----------------
     print("\n" + "=" * 70)
     print("FINAL METRICS")
     print("=" * 70)
-    
+
     rates = compute_firing_rates(model, test_loader, device)
     print("\nAverage firing rates:")
     print(f" L1: {rates['layer1_mean']:.6f}")
     print(f" L2: {rates['layer2_mean']:.6f}")
     print(f" L3: {rates['layer3_mean']:.6f}")
     print(f" Overall: {rates['overall_hidden_mean']:.6f}")
-    
+
     print("\n" + "=" * 70)
     print("Training completed successfully!")
     print("=" * 70)
-    
+
     with open(done_marker, 'w') as f:
         f.write("Training completed successfully\n")
     print(f"[DONE marker created: {done_marker}]")
-
-
-if __name__ == "__main__":
-    main()
