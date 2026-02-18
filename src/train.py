@@ -812,3 +812,6 @@ def main():
     with open(done_marker, 'w') as f:
         f.write("Training completed successfully\n")
     print(f"[DONE marker created: {done_marker}]")
+
+if __name__ == "__main__":
+    main()
