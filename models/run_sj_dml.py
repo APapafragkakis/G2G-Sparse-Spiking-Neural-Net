@@ -1,3 +1,4 @@
+# models/run_sj_dml.py
 import torch
 import torch.nn as nn
 from copy import deepcopy
@@ -6,6 +7,7 @@ import torch_directml
 
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+
 from spikingjelly.activation_based import surrogate
 from spikingjelly.activation_based import neuron, layer, functional
 
@@ -13,8 +15,18 @@ from spikingjelly.activation_based import neuron, layer, functional
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_ch, out_ch, stride=1, cnf=None, spiking_neuron=None, bn_momentum=0.1, **kwargs):
+    def __init__(
+        self,
+        in_ch,
+        out_ch,
+        stride=1,
+        cnf=None,
+        spiking_neuron=None,
+        bn_momentum=0.1,
+        **kwargs
+    ):
         super().__init__()
+
         self.conv1 = layer.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = layer.BatchNorm2d(out_ch, momentum=bn_momentum)
         self.sn1 = spiking_neuron(**deepcopy(kwargs))
@@ -32,17 +44,29 @@ class BasicBlock(nn.Module):
 
     def forward(self, x):
         identity = x
+
         out = self.sn1(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+
         if self.downsample is not None:
             identity = self.downsample(identity)
+
         out = out + identity
         out = self.sn2(out)
         return out
 
 
 class KS32_FullySpiking_Small(nn.Module):
-    def __init__(self, block, num_block, num_classes=10, cnf: str = None, spiking_neuron: callable = None, bn_momentum=0.1, **kwargs):
+    def __init__(
+        self,
+        block,
+        num_block,
+        num_classes=10,
+        cnf: str = None,
+        spiking_neuron: callable = None,
+        bn_momentum=0.1,
+        **kwargs
+    ):
         super().__init__()
         self.in_channels = 8
 
@@ -52,9 +76,12 @@ class KS32_FullySpiking_Small(nn.Module):
             spiking_neuron(**deepcopy(kwargs)),
         )
 
-        self.layer2 = self._make_layer(block, 8,  num_block[0], stride=1, cnf=cnf, spiking_neuron=spiking_neuron, bn_momentum=bn_momentum, **kwargs)
-        self.layer3 = self._make_layer(block, 16, num_block[1], stride=2, cnf=cnf, spiking_neuron=spiking_neuron, bn_momentum=bn_momentum, **kwargs)
-        self.layer4 = self._make_layer(block, 32, num_block[2], stride=2, cnf=cnf, spiking_neuron=spiking_neuron, bn_momentum=bn_momentum, **kwargs)
+        self.layer2 = self._make_layer(block, 8,  num_block[0], stride=1, cnf=cnf,
+                                       spiking_neuron=spiking_neuron, bn_momentum=bn_momentum, **kwargs)
+        self.layer3 = self._make_layer(block, 16, num_block[1], stride=2, cnf=cnf,
+                                       spiking_neuron=spiking_neuron, bn_momentum=bn_momentum, **kwargs)
+        self.layer4 = self._make_layer(block, 32, num_block[2], stride=2, cnf=cnf,
+                                       spiking_neuron=spiking_neuron, bn_momentum=bn_momentum, **kwargs)
 
         self.avgpool = layer.AdaptiveAvgPool2d((4, 4))
 
@@ -67,11 +94,13 @@ class KS32_FullySpiking_Small(nn.Module):
             layer.Linear(1024, num_classes, bias=False),
         )
 
-    def _make_layer(self, block, out_channels, num_blocks, stride, cnf: str=None, spiking_neuron: callable = None, bn_momentum=0.1, **kwargs):
+    def _make_layer(self, block, out_channels, num_blocks, stride, cnf: str = None,
+                    spiking_neuron: callable = None, bn_momentum=0.1, **kwargs):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for st in strides:
-            layers.append(block(self.in_channels, out_channels, st, cnf=cnf, spiking_neuron=spiking_neuron, bn_momentum=bn_momentum, **kwargs))
+            layers.append(block(self.in_channels, out_channels, st, cnf=cnf,
+                                spiking_neuron=spiking_neuron, bn_momentum=bn_momentum, **kwargs))
             self.in_channels = out_channels * block.expansion
         return nn.Sequential(*layers)
 
@@ -84,12 +113,37 @@ class KS32_FullySpiking_Small(nn.Module):
         x = self.fc(x)
         return x
 
+
+def ensure_time_batch_first(x: torch.Tensor, T: int) -> torch.Tensor:
+    """
+    Return x_seq with shape [T, B, C, H, W].
+
+    Accepts:
+      - x: [B, C, H, W] -> repeats to [T, B, C, H, W]
+      - x: [T, B, C, H, W] -> returns as-is
+      - x: [B, T, C, H, W] -> permutes to [T, B, C, H, W]
+    """
+    if x.dim() == 4:
+        return x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+
+    if x.dim() == 5:
+        # could be [T,B,C,H,W] or [B,T,C,H,W]
+        if x.shape[0] == T:
+            return x
+        if x.shape[1] == T:
+            return x.permute(1, 0, 2, 3, 4).contiguous()
+        # If neither matches T, still assume first dim is time
+        return x
+
+    raise RuntimeError(f"Unexpected x.dim={x.dim()} with shape {tuple(x.shape)}")
+
+
 def main():
     device = torch_directml.device()
     print("Using DirectML device:", device)
 
     # ===== FashionMNIST transforms =====
-    # FashionMNIST is 1-channel (grayscale). Your model expects 3 channels.
+    # FashionMNIST is grayscale; model expects 3 channels, so replicate to 3 channels.
     tfm_train = transforms.Compose([
         transforms.Resize((32, 32)),
         transforms.RandomCrop(32, padding=4),
@@ -107,12 +161,12 @@ def main():
     ])
 
     train_ds = datasets.FashionMNIST(root="./data", train=True, download=True, transform=tfm_train)
-    test_ds  = datasets.FashionMNIST(root="./data", train=False, download=True, transform=tfm_test)
+    test_ds = datasets.FashionMNIST(root="./data", train=False, download=True, transform=tfm_test)
 
     train_ld = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
-    test_ld  = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0)
+    test_ld = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0)
 
-    # ===== Spiking neuron (surrogate gradient is key) =====
+    # ===== Spiking neuron setup (surrogate gradient is key) =====
     spk = neuron.LIFNode
     spk_kwargs = dict(
         tau=2.0,
@@ -142,12 +196,12 @@ def main():
         weight_decay=5e-4
     )
 
-    # Optional but helpful
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=10)
+    # Optional scheduler
+    epochs = 10
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     crit = nn.CrossEntropyLoss()
 
-    epochs = 10
     for epoch in range(1, epochs + 1):
         # ----- train -----
         model.train()
@@ -159,10 +213,9 @@ def main():
 
             functional.reset_net(model)
 
-            # [B,C,H,W] -> [T,B,C,H,W]
-            x_seq = x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
-            out_seq = model(x_seq)      # [T,B,10]
-            out = out_seq.mean(0)       # [B,10]
+            x_seq = ensure_time_batch_first(x, T)   # [T,B,C,H,W]
+            out_seq = model(x_seq)                  # [T,B,10]
+            out = out_seq.mean(0)                   # [B,10]
 
             loss = crit(out, y)
 
@@ -189,7 +242,7 @@ def main():
 
                 functional.reset_net(model)
 
-                x_seq = x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+                x_seq = ensure_time_batch_first(x, T)
                 out_seq = model(x_seq)
                 out = out_seq.mean(0)
 
@@ -202,5 +255,7 @@ def main():
 
         scheduler.step()
 
+
 if __name__ == "__main__":
     main()
+
