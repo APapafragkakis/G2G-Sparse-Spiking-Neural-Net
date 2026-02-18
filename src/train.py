@@ -12,8 +12,7 @@ from models.dense_snn import DenseSNN
 from models.index_snn import IndexSNN, IndexSparseLinear
 from models.random_snn import RandomSNN, RandomGroupSparseLinear
 from models.mixer_snn import MixerSNN, MixerSparseLinear
-from models.ks32_conv import KS32GroupedEmbedder
-from conv_edge_pruning import (
+from models.ks32_conv import (
     wrap_conv2d_with_edge_masks_,
     pre_training_prune_model_,
     dynamic_pruning_step_model_,
