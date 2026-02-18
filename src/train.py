@@ -12,7 +12,13 @@ from models.dense_snn import DenseSNN
 from models.index_snn import IndexSNN, IndexSparseLinear
 from models.random_snn import RandomSNN, RandomGroupSparseLinear
 from models.mixer_snn import MixerSNN, MixerSparseLinear
-from models.frozen_resnet_cut import FrozenTruncatedResNet
+from models.ks32_conv import KS32GroupedEmbedder
+from conv_edge_pruning import (
+    wrap_conv2d_with_edge_masks_,
+    pre_training_prune_model_,
+    dynamic_pruning_step_model_,
+    post_training_prune_model_,
+)
 
 from data.fashionmnist import get_fashion_loaders
 from data.cifar10_100 import get_cifar10_loaders, get_cifar100_loaders
@@ -97,63 +103,93 @@ def get_progressive_params(epoch, num_epochs, warmup_epochs=10):
 def get_checkpoint_path(args):
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
+
     p_str = f"{args.p_inter:.2f}".replace(".", "_")
-    
-    # Updated prefix logic
-    if args.use_cnn_embed:
+
+    # Prefix: dataset / cnn_dataset / resnet_dataset
+    if getattr(args, "use_cnn_embed", False):
         prefix = f"cnn_{args.dataset}"
-    elif args.use_resnet:
+    elif getattr(args, "use_resnet", False):
         prefix = f"resnet_{args.dataset}"
     else:
         prefix = args.dataset
-    
-    if args.sparsity_mode == "dynamic":
-        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}_cp{args.cp}_cg{args.cg}.pth"
-    else:
-        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}.pth"
-    return os.path.join(checkpoint_dir, filename)
 
+    # --- NEW: conv-prune tag (only if enabled) ---
+    conv_tag = ""
+    if getattr(args, "conv_prune_scope", "none") != "none":
+        scope = args.conv_prune_scope
+        s0 = f"{getattr(args, 'conv_init_sparsity', 0.0):.2f}".replace(".", "_")
+        pd = f"{getattr(args, 'conv_dyn_prune_frac', 0.0):.3f}".replace(".", "_")
+        ui = f"{getattr(args, 'conv_update_interval', 0)}"
+        pp = f"{getattr(args, 'conv_post_prune_frac', 0.0):.2f}".replace(".", "_")
+        ft = f"{getattr(args, 'conv_finetune_epochs', 0)}"
+        conv_tag = f"_conv{scope}_S0{s0}_pd{pd}_ui{ui}_pp{pp}_ft{ft}"
+
+    if args.sparsity_mode == "dynamic":
+        filename = (
+            f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}"
+            f"_cp{args.cp}_cg{args.cg}{conv_tag}.pth"
+        )
+    else:
+        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}{conv_tag}.pth"
+
+    return os.path.join(checkpoint_dir, filename)
 
 def get_done_marker_path(args):
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
+
     p_str = f"{args.p_inter:.2f}".replace(".", "_")
-    
-    # Updated prefix logic
-    if args.use_cnn_embed:
+
+    if getattr(args, "use_cnn_embed", False):
         prefix = f"cnn_{args.dataset}"
-    elif args.use_resnet:
+    elif getattr(args, "use_resnet", False):
         prefix = f"resnet_{args.dataset}"
     else:
         prefix = args.dataset
-    
-    if args.sparsity_mode == "dynamic":
-        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}_cp{args.cp}_cg{args.cg}.DONE"
-    else:
-        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}.DONE"
-    return os.path.join(checkpoint_dir, filename)
 
+    # --- NEW: conv-prune tag (only if enabled) ---
+    conv_tag = ""
+    if getattr(args, "conv_prune_scope", "none") != "none":
+        scope = args.conv_prune_scope
+        s0 = f"{getattr(args, 'conv_init_sparsity', 0.0):.2f}".replace(".", "_")
+        pd = f"{getattr(args, 'conv_dyn_prune_frac', 0.0):.3f}".replace(".", "_")
+        ui = f"{getattr(args, 'conv_update_interval', 0)}"
+        pp = f"{getattr(args, 'conv_post_prune_frac', 0.0):.2f}".replace(".", "_")
+        ft = f"{getattr(args, 'conv_finetune_epochs', 0)}"
+        conv_tag = f"_conv{scope}_S0{s0}_pd{pd}_ui{ui}_pp{pp}_ft{ft}"
+
+    if args.sparsity_mode == "dynamic":
+        filename = (
+            f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}"
+            f"_cp{args.cp}_cg{args.cg}{conv_tag}.DONE"
+        )
+    else:
+        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}{conv_tag}.DONE"
+
+    return os.path.join(checkpoint_dir, filename)
 
 def save_checkpoint(epoch, model, optimizer, args, metrics=None):
     checkpoint_path = get_checkpoint_path(args)
+
     state_dict = model.state_dict()
-    
-    # Remove frozen feature extractor weights from checkpoint (if using pretrained ResNet)
+
+    # Αν έχεις frozen resnet και δεν θες να σώζεις extractor weights
     if getattr(model, "use_resnet", False) and not getattr(model, "use_cnn_embed", False):
         state_dict = {k: v for k, v in state_dict.items() if not k.startswith("feature_extractor.")}
-    
+
     checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': state_dict,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'args': vars(args),
-        'global_step': global_step,
+        "epoch": epoch,
+        "model_state_dict": state_dict,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+        "global_step": global_step,
     }
     if metrics is not None:
-        checkpoint['metrics'] = metrics
+        checkpoint["metrics"] = metrics
+
     torch.save(checkpoint, checkpoint_path)
     print(f"[Checkpoint saved: epoch {epoch}]")
-
 
 def load_checkpoint(model, optimizer, args):
     checkpoint_path = get_checkpoint_path(args)
@@ -172,19 +208,43 @@ def load_checkpoint(model, optimizer, args):
         print(f"[Warning: Failed to load checkpoint: {e}]")
         return 1
 
+def move_optimizer_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
 
-def build_model(model_name: str, p_inter: float, dataset: str, use_resnet: bool):
+
+def build_model(model_name, p_inter, dataset, use_resnet, args):
     feature_extractor = None
     feature_dim = input_dim
 
-    if use_resnet and dataset in ["cifar10", "cifar100"]:
+    # --- Choose ONE feature extractor ---
+    if getattr(args, "use_cnn_embed", False):
+        # Trainable CNN embedder
+        feature_extractor = KS32GroupedEmbedder(
+            in_ch=1 if dataset == "fashionmnist" else 3,
+            base_ch=args.conv_channels,
+            emb_dim=args.embedding_dim,
+        )
+        feature_dim = args.embedding_dim
+
+    elif use_resnet and dataset in ["cifar10", "cifar100"]:
+        # Frozen ResNet extractor
         cut_at = "layer1"
         pool_hw = 4  # 32 * 4 * 4 = 512
 
         print(f"Loading FrozenTruncatedResNet (pretrained) for {dataset} | cut_at={cut_at} | pool_hw={pool_hw} ...")
-        feature_extractor = FrozenTruncatedResNet(dataset=dataset, cut_at=cut_at, pool_hw=pool_hw)
+        feature_extractor = FrozenTruncatedResNet(
+            dataset=dataset,
+            cut_at=cut_at,
+            pool_hw=pool_hw,
+            cardinality=args.resnet_cardinality,
+            width_per_group=args.resnet_width_per_group,
+        )
         feature_dim = feature_extractor.out_dim  # 512
         print(f"FrozenTruncatedResNet ready. feature_dim={feature_dim}")
+
 
     # --- Build SNN classifier ---
     if model_name == "dense":
@@ -202,7 +262,8 @@ def build_model(model_name: str, p_inter: float, dataset: str, use_resnet: bool)
     model.feature_extractor = feature_extractor
 
     # This flag is used by _make_input_sequence to decide no_grad + spikegen.rate
-    model.use_resnet = bool(use_resnet and feature_extractor is not None)
+    model.use_cnn_embed = bool(getattr(args, "use_cnn_embed", False))
+    model.use_resnet = bool(use_resnet and (not model.use_cnn_embed) and feature_extractor is not None)
 
     return model
 
@@ -362,9 +423,10 @@ def _make_input_sequence(images, device, model, return_embeddings: bool = False)
         return x_seq, None
     return x_seq
 
-
-def train_one_epoch(model, loader, optimizer, device, epoch_idx, use_dst, 
-                   enforce_sparsity=False, lambda_coef=0.0, target_rate=0.09):
+def train_one_epoch(
+    model, loader, optimizer, device, epoch_idx, use_dst,
+    enforce_sparsity=False, lambda_coef=0.0, target_rate=0.09,
+    conv_target=None, conv_dyn_prune_frac=0.0, conv_update_interval=1000):
     """
     Train for one epoch. Simplified to always use CrossEntropy on spk_sum.
     """
@@ -429,7 +491,12 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, use_dst,
         
         loss.backward()
         optimizer.step()
-        
+        # Conv dynamic prune + random rewiring (keeps sparsity constant)
+        if conv_target is not None and conv_dyn_prune_frac > 0.0:
+            if global_step > 0 and (global_step % conv_update_interval == 0):
+                dynamic_pruning_step_model_(conv_target, conv_dyn_prune_frac)
+
+
         # Dynamic Sparse Training step
         if use_dst and isinstance(model, SPARSE_MODEL_TYPES):
             if global_step > 0 and global_step % UPDATE_INTERVAL == 0:
@@ -534,33 +601,40 @@ def parse_args():
     p.add_argument("--use_cnn_embed", action="store_true")
     p.add_argument("--embedding_dim", type=int, default=512)
     p.add_argument("--conv_channels", type=int, default=32)
-    p.add_argument("--resnet_connectivity", type=str, default="dense",
-                   choices=["dense", "degree"],
-                   help="dense: normal conv channels, degree: degree-controlled channel connectivity")
-    p.add_argument("--resnet_k_in", type=int, default=8,
-                   help="K input-channels per output-channel when resnet_connectivity=degree")
-    p.add_argument("--resnet_degree_mode", type=str, default="exact",
-                   choices=["exact", "max"],
-                   help="exact: exactly K connections, max: at most K connections")
-    p.add_argument("--resnet_mask_scope", type=str, default="all",
-                   choices=["all", "layer1", "layer2", "layer3", "stem"],
-                   help="Where to apply degree masking")
-
+    p.add_argument("--resnet_cardinality", type=int, default=4,
+               help="Number of groups in grouped conv (ResNeXt cardinality)")
+    p.add_argument("--resnet_width_per_group", type=int, default=4,
+               help="Width per group for bottleneck: D = cardinality * width_per_group")
+    p.add_argument("--conv_prune_scope", type=str, default="none",
+                   choices=["none", "feature_extractor", "all"],
+                   help="Where to apply conv edge pruning.")
+    p.add_argument("--conv_init_sparsity", type=float, default=0.0,
+                   help="Pre-training random sparsity S0 for conv edges (0 disables).")
+    p.add_argument("--conv_dyn_prune_frac", type=float, default=0.0,
+                   help="Dynamic prune fraction of ACTIVE edges at each update (0 disables).")
+    p.add_argument("--conv_update_interval", type=int, default=1000,
+                   help="Iterations between dynamic prune+rewire steps.")
+    p.add_argument("--conv_post_prune_frac", type=float, default=0.0,
+                   help="Post-training prune fraction of ACTIVE edges (0 disables).")
+    p.add_argument("--conv_finetune_epochs", type=int, default=0,
+                   help="Extra epochs to fine-tune after post-training pruning.")
     return p.parse_args()
 
 
 
 def main():
     args = parse_args()
+    if args.use_cnn_embed and args.use_resnet:
+        raise ValueError("Διάλεξε ένα: --use_cnn_embed ή --use_resnet (όχι και τα δύο).")
     done_marker = get_done_marker_path(args)
-    
+
     if os.path.exists(done_marker):
         print("[DONE] This experiment already finished. Skipping.")
         print(f"[INFO] To re-run, delete: {done_marker}")
         return
-    
+
     device = select_device()
-    
+
     # Update global variables
     global cp_mode, cg_mode, T, batch_size, hidden_dim
     cp_mode = args.cp
@@ -568,16 +642,16 @@ def main():
     T = args.T
     batch_size = args.batch_size
     hidden_dim = args.hidden_dim
-    
+
     global enc_mode, enc_scale, enc_bias
     enc_mode = args.enc
     enc_scale = float(args.enc_scale)
     enc_bias = float(args.enc_bias)
-    
+
     global input_dim, num_classes
-    
+
     normalize_images = bool(args.use_resnet and not args.use_cnn_embed)
-    
+
     # Load data
     if args.dataset == "fashionmnist":
         input_dim = 28 * 28
@@ -591,20 +665,20 @@ def main():
         input_dim = 3 * 32 * 32
         num_classes = 100
         train_loader, test_loader = get_cifar100_loaders(batch_size, normalize=normalize_images)
-    
+
     # Print configuration
     num_groups = 8 if args.model in ["index", "random", "mixer"] else "N/A"
-    
+
     if args.use_cnn_embed:
         feature_str = f"CNN-1L (ch={args.conv_channels}, emb={args.embedding_dim})"
     elif args.use_resnet:
         feature_str = "ResNet-32 (frozen)"
     else:
         feature_str = "Direct"
-    
+
     inject_str = "raw" if (args.use_resnet or args.use_cnn_embed) else enc_mode
     norm_str = "normalized" if normalize_images else "raw [0,1]"
-    
+
     print(
         f"[CONFIG] dataset={args.dataset} | model={args.model} | feature_extract={feature_str} | "
         f"preprocessing={norm_str} | inject={inject_str} | "
@@ -612,32 +686,55 @@ def main():
         f"batch={batch_size} | hidden_dim={hidden_dim} | groups={num_groups} | p_inter={args.p_inter}"
     )
     print("=" * 70)
-    
-    # Build model with new arguments
+
+    # ---------------- Build model ----------------
     model = build_model(
-        args.model,
-        args.p_inter,
-        args.dataset,
-        use_resnet=args.use_resnet,
+        args.model, args.p_inter, args.dataset,
+        use_resnet=args.use_resnet, args=args
     ).to(device)
-    
-    # Move feature extractor to device if it exists
+
+    # Move feature extractor to device
     if getattr(model, "feature_extractor", None) is not None:
         model.feature_extractor = model.feature_extractor.to(device)
-    
-    # Get trainable parameters
+
+    if getattr(model, "use_resnet", False) and getattr(model, "feature_extractor", None) is not None:
+        for p in model.feature_extractor.parameters():
+            p.requires_grad = False
+
+    # ---------------- Conv edge pruning (wrap + pre-prune) ----------------
+    conv_target = None
+    if args.conv_prune_scope == "feature_extractor":
+        conv_target = getattr(model, "feature_extractor", None)
+    elif args.conv_prune_scope == "all":
+        conv_target = model
+
+    if args.conv_prune_scope != "none" and conv_target is None:
+        raise ValueError(
+            f"conv_prune_scope='{args.conv_prune_scope}' αλλά feature_extractor=None."
+        )
+
+
+    if conv_target is not None and args.conv_prune_scope != "none":
+        wrap_conv2d_with_edge_masks_(conv_target)
+        print(f"[ConvPrune] Wrapped Conv2d layers in: {args.conv_prune_scope}")
+
+
+        if args.conv_init_sparsity > 0.0:
+            pre_training_prune_model_(conv_target, args.conv_init_sparsity)
+            from conv_edge_pruning import compute_model_sparsity, format_sparsity
+            print(f"[ConvPrune] Pre-training init sparsity S0={args.conv_init_sparsity:.2f} | {format_sparsity(compute_model_sparsity(conv_target))}")
+
+    # ---------------- Optimizer ----------------
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=lr, weight_decay=1e-4)
-    
+
     use_dst = (args.sparsity_mode == "dynamic")
     start_epoch = load_checkpoint(model, optimizer, args)
-    
-    if start_epoch > 1:
-        model = model.to(device)
-    
+    move_optimizer_to_device(optimizer, device)
+
     last_completed_epoch = start_epoch - 1
-    
-    # Training loop
+
+    # ---------------- Training loop ----------------
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             if args.enforce_sparsity:
@@ -648,50 +745,71 @@ def main():
                     print(f"[Sparsity] lambda={lambda_coef:.6f}, target_rate={target_rate:.4f}")
             else:
                 lambda_coef, target_rate = 0.0, 0.09
-            
+
             train_acc = train_one_epoch(
-                model, train_loader, optimizer, device, epoch, 
-                use_dst, args.enforce_sparsity, lambda_coef, target_rate
+                model, train_loader, optimizer, device, epoch,
+                use_dst, args.enforce_sparsity, lambda_coef, target_rate,
+                conv_target=conv_target,
+                conv_dyn_prune_frac=args.conv_dyn_prune_frac,
+                conv_update_interval=args.conv_update_interval,
             )
             test_acc = evaluate(model, test_loader, device)
-            
+
             print(f"Epoch {epoch:02d} | train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
-            
+
             last_completed_epoch = epoch
             save_checkpoint(epoch, model, optimizer, args, {'train_acc': train_acc, 'test_acc': test_acc})
-    
+
     except KeyboardInterrupt:
         print("\n[Training interrupted by user - checkpoint saved]")
         if last_completed_epoch >= start_epoch:
             save_checkpoint(last_completed_epoch, model, optimizer, args)
         return
-    
+
     except Exception as e:
         print(f"\n[ERROR] Training failed: {e}")
         if last_completed_epoch >= start_epoch:
             save_checkpoint(last_completed_epoch, model, optimizer, args)
         raise
-    
-    # Final evaluation
+
+    # ---------------- Conv post-training pruning + optional fine-tune ----------------
+    if conv_target is not None and args.conv_post_prune_frac > 0.0:
+        pruned = post_training_prune_model_(conv_target, args.conv_post_prune_frac)
+        print(f"[ConvPrune] Post-training prune frac={args.conv_post_prune_frac:.2f} | pruned_total={sum(pruned.values())}")
+
+        if args.conv_finetune_epochs > 0:
+            print(f"[ConvPrune] Fine-tuning for {args.conv_finetune_epochs} epochs (fixed masks, no rewiring)...")
+            for ft in range(1, args.conv_finetune_epochs + 1):
+                ft_epoch = args.epochs + ft
+
+                train_acc = train_one_epoch(
+                    model, train_loader, optimizer, device, ft_epoch,
+                    use_dst, args.enforce_sparsity, lambda_coef, target_rate,
+                    conv_target=conv_target,
+                    conv_dyn_prune_frac=0.0,  # IMPORTANT: no rewiring in fine-tune
+                    conv_update_interval=args.conv_update_interval,
+                )
+                test_acc = evaluate(model, test_loader, device)
+                print(f"[FineTune {ft:02d}] train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
+
+                save_checkpoint(ft_epoch, model, optimizer, args, {'train_acc': train_acc, 'test_acc': test_acc})
+
+    # ---------------- Final evaluation ----------------
     print("\n" + "=" * 70)
     print("FINAL METRICS")
     print("=" * 70)
-    
+
     rates = compute_firing_rates(model, test_loader, device)
     print("\nAverage firing rates:")
     print(f" L1: {rates['layer1_mean']:.6f}")
     print(f" L2: {rates['layer2_mean']:.6f}")
     print(f" L3: {rates['layer3_mean']:.6f}")
     print(f" Overall: {rates['overall_hidden_mean']:.6f}")
-    
+
     print("\n" + "=" * 70)
     print("Training completed successfully!")
     print("=" * 70)
-    
+
     with open(done_marker, 'w') as f:
         f.write("Training completed successfully\n")
     print(f"[DONE marker created: {done_marker}]")
-
-
-if __name__ == "__main__":
-    main()

@@ -1,4 +1,3 @@
-# models/masked_conv.py
 from __future__ import annotations
 
 import torch
