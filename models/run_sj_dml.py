@@ -110,11 +110,11 @@ def main():
 
     functional.set_step_mode(model, 's')
 
-    opt = torch.optim.Adam(
+    opt = torch.optim.SGD(
         model.parameters(),
-        lr=1e-3,
-        weight_decay=1e-4,
-        foreach=False
+        lr=0.1,
+        momentum=0.9,
+        weight_decay=5e-4
     )
 
     crit = nn.CrossEntropyLoss()
