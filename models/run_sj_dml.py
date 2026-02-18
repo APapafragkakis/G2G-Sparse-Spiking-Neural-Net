@@ -110,7 +110,13 @@ def main():
 
     functional.set_step_mode(model, 's')
 
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(
+        model.parameters(),
+        lr=1e-3,
+        weight_decay=1e-4,
+        foreach=False
+    )
+
     crit = nn.CrossEntropyLoss()
 
     for epoch in range(1, 6):
