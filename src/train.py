@@ -103,62 +103,71 @@ def get_progressive_params(epoch, num_epochs, warmup_epochs=10):
 def get_checkpoint_path(args):
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
+
     p_str = f"{args.p_inter:.2f}".replace(".", "_")
-    
-    # Updated prefix logic
-    if args.use_cnn_embed:
+
+    # Prefix: dataset / cnn_dataset / resnet_dataset
+    if getattr(args, "use_cnn_embed", False):
         prefix = f"cnn_{args.dataset}"
-    elif args.use_resnet:
+    elif getattr(args, "use_resnet", False):
         prefix = f"resnet_{args.dataset}"
     else:
         prefix = args.dataset
-    
-    if args.sparsity_mode == "dynamic":
-        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}_cp{args.cp}_cg{args.cg}.pth"
-    else:
-        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}.pth"
-    return os.path.join(checkpoint_dir, filename)
 
+    # --- NEW: conv-prune tag (only if enabled) ---
+    conv_tag = ""
+    if getattr(args, "conv_prune_scope", "none") != "none":
+        scope = args.conv_prune_scope
+        s0 = f"{getattr(args, 'conv_init_sparsity', 0.0):.2f}".replace(".", "_")
+        pd = f"{getattr(args, 'conv_dyn_prune_frac', 0.0):.3f}".replace(".", "_")
+        ui = f"{getattr(args, 'conv_update_interval', 0)}"
+        pp = f"{getattr(args, 'conv_post_prune_frac', 0.0):.2f}".replace(".", "_")
+        ft = f"{getattr(args, 'conv_finetune_epochs', 0)}"
+        conv_tag = f"_conv{scope}_S0{s0}_pd{pd}_ui{ui}_pp{pp}_ft{ft}"
+
+    if args.sparsity_mode == "dynamic":
+        filename = (
+            f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}"
+            f"_cp{args.cp}_cg{args.cg}{conv_tag}.pth"
+        )
+    else:
+        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}{conv_tag}.pth"
+
+    return os.path.join(checkpoint_dir, filename)
 
 def get_done_marker_path(args):
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
+
     p_str = f"{args.p_inter:.2f}".replace(".", "_")
-    
-    # Updated prefix logic
-    if args.use_cnn_embed:
+
+    if getattr(args, "use_cnn_embed", False):
         prefix = f"cnn_{args.dataset}"
-    elif args.use_resnet:
+    elif getattr(args, "use_resnet", False):
         prefix = f"resnet_{args.dataset}"
     else:
         prefix = args.dataset
-    
+
+    # --- NEW: conv-prune tag (only if enabled) ---
+    conv_tag = ""
+    if getattr(args, "conv_prune_scope", "none") != "none":
+        scope = args.conv_prune_scope
+        s0 = f"{getattr(args, 'conv_init_sparsity', 0.0):.2f}".replace(".", "_")
+        pd = f"{getattr(args, 'conv_dyn_prune_frac', 0.0):.3f}".replace(".", "_")
+        ui = f"{getattr(args, 'conv_update_interval', 0)}"
+        pp = f"{getattr(args, 'conv_post_prune_frac', 0.0):.2f}".replace(".", "_")
+        ft = f"{getattr(args, 'conv_finetune_epochs', 0)}"
+        conv_tag = f"_conv{scope}_S0{s0}_pd{pd}_ui{ui}_pp{pp}_ft{ft}"
+
     if args.sparsity_mode == "dynamic":
-        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}_cp{args.cp}_cg{args.cg}.DONE"
+        filename = (
+            f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}"
+            f"_cp{args.cp}_cg{args.cg}{conv_tag}.DONE"
+        )
     else:
-        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}.DONE"
+        filename = f"{prefix}_{args.model}_p{p_str}_T{args.T}_{args.enc}{conv_tag}.DONE"
+
     return os.path.join(checkpoint_dir, filename)
-
-
-def save_checkpoint(epoch, model, optimizer, args, metrics=None):
-    checkpoint_path = get_checkpoint_path(args)
-    state_dict = model.state_dict()
-    
-    # Remove frozen feature extractor weights from checkpoint (if using pretrained ResNet)
-    if getattr(model, "use_resnet", False) and not getattr(model, "use_cnn_embed", False):
-        state_dict = {k: v for k, v in state_dict.items() if not k.startswith("feature_extractor.")}
-    
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': state_dict,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'args': vars(args),
-        'global_step': global_step,
-    }
-    if metrics is not None:
-        checkpoint['metrics'] = metrics
-    torch.save(checkpoint, checkpoint_path)
-    print(f"[Checkpoint saved: epoch {epoch}]")
 
 
 def load_checkpoint(model, optimizer, args):
