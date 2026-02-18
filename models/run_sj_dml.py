@@ -115,27 +115,23 @@ class KS32_FullySpiking_Small(nn.Module):
 
 
 def ensure_time_batch_first(x: torch.Tensor, T: int) -> torch.Tensor:
-    """
-    Return x_seq with shape [T, B, C, H, W].
-
-    Accepts:
-      - x: [B, C, H, W] -> repeats to [T, B, C, H, W]
-      - x: [T, B, C, H, W] -> returns as-is
-      - x: [B, T, C, H, W] -> permutes to [T, B, C, H, W]
-    """
-    if x.dim() == 4:
-        return x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+    # Debug once if you want:
+    # print("ensure_time_batch_first got:", x.dim(), tuple(x.shape))
 
     if x.dim() == 5:
-        # could be [T,B,C,H,W] or [B,T,C,H,W]
+        # [T,B,C,H,W] or [B,T,C,H,W]
         if x.shape[0] == T:
             return x
         if x.shape[1] == T:
             return x.permute(1, 0, 2, 3, 4).contiguous()
-        # If neither matches T, still assume first dim is time
+        # If T doesn't match any dimension, assume it's already [T,B,C,H,W]
         return x
 
+    if x.dim() == 4:
+        return x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+
     raise RuntimeError(f"Unexpected x.dim={x.dim()} with shape {tuple(x.shape)}")
+
 
 
 def main():
@@ -212,7 +208,8 @@ def main():
             y = y.to(device)
 
             functional.reset_net(model)
-
+            if epoch == 1 and i == 0:
+                print("BATCH x.dim/x.shape:", x.dim(), tuple(x.shape))
             x_seq = ensure_time_batch_first(x, T)   # [T,B,C,H,W]
             out_seq = model(x_seq)                  # [T,B,10]
             out = out_seq.mean(0)                   # [B,10]
