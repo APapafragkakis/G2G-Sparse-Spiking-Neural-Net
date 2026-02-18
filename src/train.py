@@ -169,6 +169,27 @@ def get_done_marker_path(args):
 
     return os.path.join(checkpoint_dir, filename)
 
+def save_checkpoint(epoch, model, optimizer, args, metrics=None):
+    checkpoint_path = get_checkpoint_path(args)
+
+    state_dict = model.state_dict()
+
+    # Αν έχεις frozen resnet και δεν θες να σώζεις extractor weights
+    if getattr(model, "use_resnet", False) and not getattr(model, "use_cnn_embed", False):
+        state_dict = {k: v for k, v in state_dict.items() if not k.startswith("feature_extractor.")}
+
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": state_dict,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+        "global_step": global_step,
+    }
+    if metrics is not None:
+        checkpoint["metrics"] = metrics
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"[Checkpoint saved: epoch {epoch}]")
 
 def load_checkpoint(model, optimizer, args):
     checkpoint_path = get_checkpoint_path(args)
@@ -452,9 +473,10 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
         # Conv dynamic prune + random rewiring (keeps sparsity constant)
-        if conv_target is not None and conv_dyn_prune_frac > 0.0:
+        if conv_target is not None and conv_dyn_prune_frac > 0.0 and model.training:
             if global_step > 0 and (global_step % conv_update_interval == 0):
                 dynamic_pruning_step_model_(conv_target, conv_dyn_prune_frac)
+
 
         # Dynamic Sparse Training step
         if use_dst and isinstance(model, SPARSE_MODEL_TYPES):
@@ -661,8 +683,16 @@ def main():
     elif args.conv_prune_scope == "all":
         conv_target = model
 
+    if args.conv_prune_scope != "none" and conv_target is None:
+        raise ValueError(
+            f"conv_prune_scope='{args.conv_prune_scope}' αλλά feature_extractor=None."
+        )
+
+
     if conv_target is not None and args.conv_prune_scope != "none":
         wrap_conv2d_with_edge_masks_(conv_target)
+        print(f"[ConvPrune] Wrapped Conv2d layers in: {args.conv_prune_scope}")
+
 
         if args.conv_init_sparsity > 0.0:
             pre_training_prune_model_(conv_target, args.conv_init_sparsity)
@@ -674,9 +704,6 @@ def main():
 
     use_dst = (args.sparsity_mode == "dynamic")
     start_epoch = load_checkpoint(model, optimizer, args)
-
-    if start_epoch > 1:
-        model = model.to(device)
 
     last_completed_epoch = start_epoch - 1
 
