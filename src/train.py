@@ -703,8 +703,21 @@ def parse_args():
                help="Number of groups in grouped conv (ResNeXt cardinality)")
     p.add_argument("--resnet_width_per_group", type=int, default=4,
                help="Width per group for bottleneck: D = cardinality * width_per_group")
-
-
+    p.add_argument("--conv_prune_scope", type=str, default="none",
+                   choices=["none", "feature_extractor", "all"],
+                   help="Where to apply conv edge pruning.")
+    p.add_argument("--conv_init_sparsity", type=float, default=0.0,
+                   help="Pre-training random sparsity S0 for conv edges. (0.0 disables)")
+    p.add_argument("--conv_dyn_prune_frac", type=float, default=0.0,
+                   help="Dynamic pruning fraction of ACTIVE edges to prune at each update. (0.0 disables)")
+    p.add_argument("--conv_update_interval", type=int, default=1000,
+                   help="How many iterations between dynamic prune+rewire steps.")
+    p.add_argument("--conv_post_prune_frac", type=float, default=0.0,
+                   help="Post-training pruning fraction of ACTIVE edges to prune after training. (0.0 disables)")
+    p.add_argument("--conv_finetune_epochs", type=int, default=0,
+                   help="Extra epochs to fine-tune after post-training pruning.")
+    p.add_argument("--conv_seed", type=int, default=123,
+                   help="Seed for conv pruning randomness (init + rewiring).")
     return p.parse_args()
 
 
