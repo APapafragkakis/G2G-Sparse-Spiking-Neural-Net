@@ -368,6 +368,165 @@ def _make_input_sequence(images, device, model, return_embeddings: bool = False)
         return x_seq, None
     return x_seq
 
+# -----------------------------
+# Conv edge pruning (channel-level) utilities
+# edges: c -> c'  (kernel W[c', c, :, :])
+# -----------------------------
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple
+
+class ChannelMaskedConv2d(nn.Module):
+    """
+    Wraps an nn.Conv2d and applies a channel-edge mask [C_out, C_in].
+    Effective weight: W_eff = W * mask[:, :, None, None]
+    Supports groups == 1 only.
+    """
+    def __init__(self, conv: nn.Conv2d):
+        super().__init__()
+        if not isinstance(conv, nn.Conv2d):
+            raise TypeError("ChannelMaskedConv2d expects nn.Conv2d")
+        if conv.groups != 1:
+            raise NotImplementedError("Only groups==1 supported for now.")
+        self.conv = conv
+        self.register_buffer("mask", torch.ones(conv.out_channels, conv.in_channels, dtype=torch.float32))
+
+    def forward(self, x):
+        w_eff = self.conv.weight * self.mask[:, :, None, None]
+        return nn.functional.conv2d(
+            x, w_eff, self.conv.bias,
+            stride=self.conv.stride, padding=self.conv.padding,
+            dilation=self.conv.dilation, groups=self.conv.groups
+        )
+
+    @property
+    def weight(self):
+        return self.conv.weight
+
+
+def iter_masked_convs(model: nn.Module) -> Iterable[Tuple[str, ChannelMaskedConv2d]]:
+    for name, m in model.named_modules():
+        if isinstance(m, ChannelMaskedConv2d):
+            yield name, m
+
+
+def wrap_conv2d_with_edge_masks_(model: nn.Module, include_names: Optional[List[str]] = None) -> nn.Module:
+    """
+    In-place replace eligible nn.Conv2d with ChannelMaskedConv2d.
+    include_names: if provided, wrap only modules whose full name contains any substring in list.
+    """
+    def should_wrap(full_name: str, module: nn.Module) -> bool:
+        if not isinstance(module, nn.Conv2d):
+            return False
+        if module.groups != 1:
+            return False
+        if include_names is None:
+            return True
+        return any(s in full_name for s in include_names)
+
+    for parent_name, parent in model.named_modules():
+        for child_name, child in list(parent.named_children()):
+            full = f"{parent_name}.{child_name}".lstrip(".")
+            if should_wrap(full, child):
+                setattr(parent, child_name, ChannelMaskedConv2d(child))
+    return model
+
+
+@torch.no_grad()
+def init_random_sparsity_(layer: ChannelMaskedConv2d, sparsity: float, generator: Optional[torch.Generator] = None):
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError("sparsity must be in [0,1)")
+    total = layer.mask.numel()
+    num_prune = int(round(sparsity * total))
+    layer.mask.fill_(1.0)
+    if num_prune <= 0:
+        return
+    perm = torch.randperm(total, generator=generator, device=layer.mask.device)
+    layer.mask.view(-1)[perm[:num_prune]] = 0.0
+
+
+@torch.no_grad()
+def edge_importance_l1(layer: ChannelMaskedConv2d) -> torch.Tensor:
+    # [C_out, C_in]
+    return layer.weight.abs().sum(dim=(2, 3))
+
+
+@torch.no_grad()
+def prune_low_importance_active_(layer: ChannelMaskedConv2d, prune_frac: float) -> int:
+    if prune_frac <= 0:
+        return 0
+    m = layer.mask
+    active = m.bool()
+    n_active = int(active.sum().item())
+    if n_active == 0:
+        return 0
+    n_prune = int(prune_frac * n_active)
+    if n_prune < 1:
+        return 0
+
+    imp = edge_importance_l1(layer)
+    active_imp = imp[active].view(-1)
+    k = min(n_prune, active_imp.numel())
+    thr, _ = torch.kthvalue(active_imp, k)
+    to_prune = (imp <= thr) & active
+
+    pruned = int(to_prune.sum().item())
+    m[to_prune] = 0.0
+    return pruned
+
+
+@torch.no_grad()
+def rewire_random_inactive_(layer: ChannelMaskedConv2d, num_to_grow: int, generator: Optional[torch.Generator] = None) -> int:
+    if num_to_grow <= 0:
+        return 0
+    m = layer.mask
+    inactive = (~m.bool())
+    idx = inactive.nonzero(as_tuple=False)
+    if idx.numel() == 0:
+        return 0
+    n = min(num_to_grow, idx.size(0))
+    perm = torch.randperm(idx.size(0), generator=generator, device=m.device)[:n]
+    grow = idx[perm]
+    m[grow[:, 0], grow[:, 1]] = 1.0
+    return int(n)
+
+
+@torch.no_grad()
+def dynamic_prune_and_rewire_(layer: ChannelMaskedConv2d, prune_frac: float, generator: Optional[torch.Generator] = None) -> Dict[str, int]:
+    pruned = prune_low_importance_active_(layer, prune_frac)
+    grown = rewire_random_inactive_(layer, pruned, generator=generator)
+    return {"pruned": pruned, "grown": grown}
+
+
+@torch.no_grad()
+def pre_training_prune_model_(model: nn.Module, sparsity: float, seed: Optional[int] = None):
+    for name, layer in iter_masked_convs(model):
+        g = None
+        if seed is not None:
+            g = torch.Generator(device=layer.mask.device)
+            g.manual_seed(abs(hash((seed, name, "pre"))) % (2**31))
+        init_random_sparsity_(layer, sparsity, generator=g)
+
+
+@torch.no_grad()
+def dynamic_pruning_step_model_(model: nn.Module, prune_frac: float, seed: Optional[int] = None) -> Dict[str, Dict[str, int]]:
+    out = {}
+    for name, layer in iter_masked_convs(model):
+        g = None
+        if seed is not None:
+            g = torch.Generator(device=layer.mask.device)
+            g.manual_seed(abs(hash((seed, name, "dyn"))) % (2**31))
+        out[name] = dynamic_prune_and_rewire_(layer, prune_frac, generator=g)
+    return out
+
+
+@torch.no_grad()
+def post_training_prune_model_(model: nn.Module, prune_frac_of_active: float) -> Dict[str, int]:
+    out = {}
+    for name, layer in iter_masked_convs(model):
+        out[name] = prune_low_importance_active_(layer, prune_frac_of_active)
+    return out
+
 
 def train_one_epoch(model, loader, optimizer, device, epoch_idx, use_dst, 
                    enforce_sparsity=False, lambda_coef=0.0, target_rate=0.09):

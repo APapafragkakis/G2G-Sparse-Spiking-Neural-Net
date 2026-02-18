@@ -1,88 +1,317 @@
-# models/ks32_grouped.py
+# conv_edge_pruning.py
+# Channel-edge pruning for Conv2d layers (edges: input channel c -> output channel c')
+#
+# Implements:
+# 1) Pre-training pruning (random mask at init)
+# 2) Dynamic pruning during training (periodic prune lowest-importance active edges + random rewiring)
+# 3) Post-training pruning (prune low-importance edges + optional fine-tune outside this module)
+#
+# Assumptions:
+# - Edge importance is L1 norm of the kernel: importance(c->c') = ||K_{c',c}||_1
+# - "Ablating an edge" means zeroing the whole kernel W[c',c,:,:] (implemented via a binary mask).
+# - Currently supports standard (dense) conv: groups == 1.
+#   For grouped conv, connectivity is block-diagonal and needs group-aware masking.
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 
-class ResNeXtBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=1, cardinality=4, width_per_group=4):
+
+# -----------------------------
+# Masked conv wrapper
+# -----------------------------
+
+class ChannelMaskedConv2d(nn.Module):
+    """
+    Wraps an nn.Conv2d and applies a channel-edge mask of shape [C_out, C_in].
+
+    Effective weight: W_eff = W * mask[:, :, None, None]
+
+    Notes:
+    - Supports groups == 1 only.
+    - Bias is supported but typical convs use bias=False when followed by BN.
+    """
+    def __init__(self, conv: nn.Conv2d):
         super().__init__()
-        D = cardinality * width_per_group
+        if not isinstance(conv, nn.Conv2d):
+            raise TypeError("ChannelMaskedConv2d expects an nn.Conv2d")
 
-        self.conv1 = nn.Conv2d(in_ch, D, kernel_size=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(D)
-
-        self.conv2 = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1,
-                               groups=cardinality, bias=False)
-        self.bn2   = nn.BatchNorm2d(D)
-
-        self.conv3 = nn.Conv2d(D, out_ch, kernel_size=1, bias=False)
-        self.bn3   = nn.BatchNorm2d(out_ch)
-
-        self.relu = nn.ReLU(inplace=True)
-
-        self.downsample = None
-        if stride != 1 or in_ch != out_ch:
-            self.downsample = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_ch),
+        if conv.groups != 1:
+            raise NotImplementedError(
+                "ChannelMaskedConv2d currently supports groups==1 only. "
+                "For grouped conv, use a group-aware mask (block-diagonal connectivity)."
             )
 
-    def forward(self, x):
-        identity = x
+        self.conv = conv
+        # mask[c_out, c_in] in {0,1}
+        mask = torch.ones(conv.out_channels, conv.in_channels, dtype=torch.float32)
+        self.register_buffer("mask", mask)
 
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        return self.relu(out + identity)
-
-
-class KS32GroupedEmbedder(nn.Module):
-    """
-    CIFAR: input [B,3,32,32]
-    Stages: 8 -> 16 -> 32, output embedding dim = 32*4*4 = 512
-    """
-    def __init__(self, num_blocks=(5,5,5), cardinality=4, width_per_group=4, out_pool_hw=4):
-        super().__init__()
-        self.in_ch = 8
-
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, self.in_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(self.in_ch),
-            nn.ReLU(inplace=True),
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.conv.weight
+        m = self.mask
+        w_eff = w * m[:, :, None, None]
+        return nn.functional.conv2d(
+            x,
+            w_eff,
+            self.conv.bias,
+            stride=self.conv.stride,
+            padding=self.conv.padding,
+            dilation=self.conv.dilation,
+            groups=self.conv.groups,
         )
 
-        self.layer2 = self._make_layer(8,  num_blocks[0], stride=1, cardinality=cardinality, width_per_group=width_per_group)
-        self.layer3 = self._make_layer(16, num_blocks[1], stride=2, cardinality=cardinality, width_per_group=width_per_group)
-        self.layer4 = self._make_layer(32, num_blocks[2], stride=2, cardinality=cardinality, width_per_group=width_per_group)
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.conv.weight
 
-        self.pool = nn.AdaptiveAvgPool2d((out_pool_hw, out_pool_hw))
-        self.out_dim = 32 * out_pool_hw * out_pool_hw  # default 32*4*4=512
+    @property
+    def in_channels(self) -> int:
+        return self.conv.in_channels
 
-        # Kaiming init (συμβατό με ReLU)
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1.0)
-                nn.init.constant_(m.bias, 0.0)
+    @property
+    def out_channels(self) -> int:
+        return self.conv.out_channels
 
-    def _make_layer(self, out_ch, n_blocks, stride, cardinality, width_per_group):
-        layers = []
-        layers.append(ResNeXtBlock(self.in_ch, out_ch, stride=stride,
-                                  cardinality=cardinality, width_per_group=width_per_group))
-        self.in_ch = out_ch
-        for _ in range(n_blocks - 1):
-            layers.append(ResNeXtBlock(self.in_ch, out_ch, stride=1,
-                                      cardinality=cardinality, width_per_group=width_per_group))
-        return nn.Sequential(*layers)
+    def extra_repr(self) -> str:
+        active = int(self.mask.sum().item())
+        total = int(self.mask.numel())
+        return f"masked_edges={active}/{total} ({1 - active/total:.2%} sparsity)"
 
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.pool(x)
-        return x.flatten(1)  # [B, 512]
+
+# -----------------------------
+# Utilities: model surgery
+# -----------------------------
+
+def iter_masked_convs(model: nn.Module) -> Iterable[Tuple[str, ChannelMaskedConv2d]]:
+    """Yield (name, layer) for all ChannelMaskedConv2d modules in model."""
+    for name, m in model.named_modules():
+        if isinstance(m, ChannelMaskedConv2d):
+            yield name, m
+
+
+def wrap_conv2d_with_edge_masks_(
+    model: nn.Module,
+    *,
+    include_names: Optional[List[str]] = None
+) -> nn.Module:
+    """
+    In-place: replace eligible nn.Conv2d layers with ChannelMaskedConv2d wrappers.
+
+    Args:
+        include_names:
+            If provided, only wrap convs whose full module name contains ANY of these substrings.
+            Example: include_names=["layer1", "layer2"].
+
+    Returns:
+        model (modified in-place)
+    """
+    def should_wrap(full_name: str, module: nn.Module) -> bool:
+        if not isinstance(module, nn.Conv2d):
+            return False
+        if module.groups != 1:
+            return False
+        if include_names is None:
+            return True
+        return any(s in full_name for s in include_names)
+
+    # Walk children so we can replace on parent
+    for parent_name, parent in model.named_modules():
+        for child_name, child in list(parent.named_children()):
+            full = f"{parent_name}.{child_name}".lstrip(".")
+            if should_wrap(full, child):
+                setattr(parent, child_name, ChannelMaskedConv2d(child))
+    return model
+
+
+# -----------------------------
+# Core pruning logic
+# -----------------------------
+
+@torch.no_grad()
+def init_random_sparsity_(
+    layer: ChannelMaskedConv2d,
+    sparsity: float,
+    *,
+    generator: Optional[torch.Generator] = None
+) -> None:
+    """
+    Pre-training pruning: randomly deactivate a fixed percentage of edges.
+
+    sparsity: fraction of edges to deactivate in [0,1)
+    """
+    if not (0.0 <= sparsity < 1.0):
+        raise ValueError("sparsity must be in [0,1)")
+
+    total = layer.mask.numel()
+    num_prune = int(round(sparsity * total))
+
+    layer.mask.fill_(1.0)
+    if num_prune <= 0:
+        return
+
+    perm = torch.randperm(total, generator=generator, device=layer.mask.device)
+    prune_idx = perm[:num_prune]
+    layer.mask.view(-1)[prune_idx] = 0.0
+
+
+@torch.no_grad()
+def edge_importance_l1(layer: ChannelMaskedConv2d) -> torch.Tensor:
+    """
+    importance(c->c') = ||K_{c',c}||_1
+    Returns tensor [C_out, C_in]
+    """
+    w = layer.weight
+    return w.abs().sum(dim=(2, 3))
+
+
+@torch.no_grad()
+def prune_low_importance_active_(layer: ChannelMaskedConv2d, prune_frac: float) -> int:
+    """
+    Remove a fraction of currently ACTIVE edges with lowest importance.
+    Returns number of edges pruned.
+    """
+    if prune_frac <= 0:
+        return 0
+
+    m = layer.mask
+    active = m.bool()
+    num_active = int(active.sum().item())
+    if num_active == 0:
+        return 0
+
+    num_to_prune = int(prune_frac * num_active)
+    if num_to_prune < 1:
+        return 0
+
+    imp = edge_importance_l1(layer)
+    active_imp = imp[active].view(-1)
+
+    k = min(num_to_prune, active_imp.numel())
+    threshold, _ = torch.kthvalue(active_imp, k)
+
+    to_prune = (imp <= threshold) & active
+    pruned = int(to_prune.sum().item())
+    m[to_prune] = 0.0
+    return pruned
+
+
+@torch.no_grad()
+def rewire_random_inactive_(
+    layer: ChannelMaskedConv2d,
+    num_to_grow: int,
+    *,
+    generator: Optional[torch.Generator] = None
+) -> int:
+    """
+    Randomly activate num_to_grow currently INACTIVE edges.
+    Returns number actually activated.
+    """
+    if num_to_grow <= 0:
+        return 0
+
+    m = layer.mask
+    inactive = (~m.bool())
+    inactive_idx = inactive.nonzero(as_tuple=False)
+    if inactive_idx.numel() == 0:
+        return 0
+
+    n = min(num_to_grow, inactive_idx.size(0))
+    perm = torch.randperm(inactive_idx.size(0), generator=generator, device=m.device)[:n]
+    grow_idx = inactive_idx[perm]
+    m[grow_idx[:, 0], grow_idx[:, 1]] = 1.0
+    return int(n)
+
+
+@torch.no_grad()
+def dynamic_prune_and_rewire_(
+    layer: ChannelMaskedConv2d,
+    prune_frac: float,
+    *,
+    generator: Optional[torch.Generator] = None
+) -> Dict[str, int]:
+    """
+    Dynamic pruning step for one layer:
+      1) prune bottom prune_frac of active edges by L1-importance
+      2) rewire the same count by randomly activating inactive edges
+    """
+    pruned = prune_low_importance_active_(layer, prune_frac)
+    grown = rewire_random_inactive_(layer, pruned, generator=generator)
+    return {"pruned": pruned, "grown": grown}
+
+
+# -----------------------------
+# Model-level APIs
+# -----------------------------
+
+@dataclass
+class SparsityStats:
+    total_edges: int
+    active_edges: int
+
+    @property
+    def sparsity(self) -> float:
+        if self.total_edges == 0:
+            return 0.0
+        return 1.0 - (self.active_edges / self.total_edges)
+
+
+@torch.no_grad()
+def compute_model_sparsity(model: nn.Module) -> SparsityStats:
+    total = 0
+    active = 0
+    for _, layer in iter_masked_convs(model):
+        total += layer.mask.numel()
+        active += int(layer.mask.sum().item())
+    return SparsityStats(total_edges=total, active_edges=active)
+
+
+@torch.no_grad()
+def pre_training_prune_model_(model: nn.Module, sparsity: float, *, seed: Optional[int] = None) -> None:
+    """
+    Apply pre-training pruning to all masked conv layers.
+    """
+    for name, layer in iter_masked_convs(model):
+        g = None
+        if seed is not None:
+            g = torch.Generator(device=layer.mask.device)
+            g.manual_seed(abs(hash((seed, name, "pre"))) % (2**31))
+        init_random_sparsity_(layer, sparsity, generator=g)
+
+
+@torch.no_grad()
+def dynamic_pruning_step_model_(model: nn.Module, prune_frac: float, *, seed: Optional[int] = None) -> Dict[str, Dict[str, int]]:
+    """
+    Apply one dynamic prune+rewire step to all masked conv layers.
+    Returns per-layer counts.
+    """
+    results: Dict[str, Dict[str, int]] = {}
+    for name, layer in iter_masked_convs(model):
+        g = None
+        if seed is not None:
+            g = torch.Generator(device=layer.mask.device)
+            g.manual_seed(abs(hash((seed, name, "dyn"))) % (2**31))
+        results[name] = dynamic_prune_and_rewire_(layer, prune_frac, generator=g)
+    return results
+
+
+@torch.no_grad()
+def post_training_prune_model_(model: nn.Module, prune_frac_of_active: float) -> Dict[str, int]:
+    """
+    Post-training pruning: remove a fraction of ACTIVE edges (no rewiring).
+    After calling this, keep masks fixed and fine-tune outside this module.
+
+    Returns per-layer pruned counts.
+    """
+    out: Dict[str, int] = {}
+    for name, layer in iter_masked_convs(model):
+        out[name] = prune_low_importance_active_(layer, prune_frac_of_active)
+    return out
+
+
+def format_sparsity(stats: SparsityStats) -> str:
+    return f"active_edges={stats.active_edges}/{stats.total_edges} | sparsity={stats.sparsity:.2%}"
