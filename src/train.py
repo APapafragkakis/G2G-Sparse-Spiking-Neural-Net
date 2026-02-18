@@ -12,7 +12,7 @@ from models.dense_snn import DenseSNN
 from models.index_snn import IndexSNN, IndexSparseLinear
 from models.random_snn import RandomSNN, RandomGroupSparseLinear
 from models.mixer_snn import MixerSNN, MixerSparseLinear
-from models.ks32_grouped import KS32GroupedEmbedder
+from models.ks32_conv import KS32GroupedEmbedder
 from conv_edge_pruning import (
     wrap_conv2d_with_edge_masks_,
     pre_training_prune_model_,
@@ -208,25 +208,43 @@ def load_checkpoint(model, optimizer, args):
         print(f"[Warning: Failed to load checkpoint: {e}]")
         return 1
 
+def move_optimizer_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
 
 def build_model(model_name, p_inter, dataset, use_resnet, args):
     feature_extractor = None
     feature_dim = input_dim
 
-    if use_resnet and dataset in ["cifar10", "cifar100"]:
+    # --- Choose ONE feature extractor ---
+    if getattr(args, "use_cnn_embed", False):
+        # Trainable CNN embedder
+        feature_extractor = KS32GroupedEmbedder(
+            in_ch=1 if dataset == "fashionmnist" else 3,
+            base_ch=args.conv_channels,
+            emb_dim=args.embedding_dim,
+        )
+        feature_dim = args.embedding_dim
+
+    elif use_resnet and dataset in ["cifar10", "cifar100"]:
+        # Frozen ResNet extractor
         cut_at = "layer1"
         pool_hw = 4  # 32 * 4 * 4 = 512
 
         print(f"Loading FrozenTruncatedResNet (pretrained) for {dataset} | cut_at={cut_at} | pool_hw={pool_hw} ...")
         feature_extractor = FrozenTruncatedResNet(
-        dataset=dataset,
-        cut_at=cut_at,
-        pool_hw=pool_hw,
-        cardinality=args.resnet_cardinality,
-        width_per_group=args.resnet_width_per_group,
-    )
+            dataset=dataset,
+            cut_at=cut_at,
+            pool_hw=pool_hw,
+            cardinality=args.resnet_cardinality,
+            width_per_group=args.resnet_width_per_group,
+        )
         feature_dim = feature_extractor.out_dim  # 512
         print(f"FrozenTruncatedResNet ready. feature_dim={feature_dim}")
+
 
     # --- Build SNN classifier ---
     if model_name == "dense":
@@ -244,7 +262,8 @@ def build_model(model_name, p_inter, dataset, use_resnet, args):
     model.feature_extractor = feature_extractor
 
     # This flag is used by _make_input_sequence to decide no_grad + spikegen.rate
-    model.use_resnet = bool(use_resnet and feature_extractor is not None)
+    model.use_cnn_embed = bool(getattr(args, "use_cnn_embed", False))
+    model.use_resnet = bool(use_resnet and (not model.use_cnn_embed) and feature_extractor is not None)
 
     return model
 
@@ -473,7 +492,7 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
         # Conv dynamic prune + random rewiring (keeps sparsity constant)
-        if conv_target is not None and conv_dyn_prune_frac > 0.0 and model.training:
+        if conv_target is not None and conv_dyn_prune_frac > 0.0:
             if global_step > 0 and (global_step % conv_update_interval == 0):
                 dynamic_pruning_step_model_(conv_target, conv_dyn_prune_frac)
 
@@ -605,6 +624,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.use_cnn_embed and args.use_resnet:
+        raise ValueError("Διάλεξε ένα: --use_cnn_embed ή --use_resnet (όχι και τα δύο).")
     done_marker = get_done_marker_path(args)
 
     if os.path.exists(done_marker):
@@ -672,9 +693,13 @@ def main():
         use_resnet=args.use_resnet, args=args
     ).to(device)
 
-    # Move feature extractor to device if it exists (IMPORTANT: do this BEFORE wrapping)
+    # Move feature extractor to device
     if getattr(model, "feature_extractor", None) is not None:
         model.feature_extractor = model.feature_extractor.to(device)
+
+    if getattr(model, "use_resnet", False) and getattr(model, "feature_extractor", None) is not None:
+        for p in model.feature_extractor.parameters():
+            p.requires_grad = False
 
     # ---------------- Conv edge pruning (wrap + pre-prune) ----------------
     conv_target = None
@@ -696,7 +721,8 @@ def main():
 
         if args.conv_init_sparsity > 0.0:
             pre_training_prune_model_(conv_target, args.conv_init_sparsity)
-            print(f"[ConvPrune] Pre-training init sparsity S0={args.conv_init_sparsity:.2f}")
+            from conv_edge_pruning import compute_model_sparsity, format_sparsity
+            print(f"[ConvPrune] Pre-training init sparsity S0={args.conv_init_sparsity:.2f} | {format_sparsity(compute_model_sparsity(conv_target))}")
 
     # ---------------- Optimizer ----------------
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -704,6 +730,7 @@ def main():
 
     use_dst = (args.sparsity_mode == "dynamic")
     start_epoch = load_checkpoint(model, optimizer, args)
+    move_optimizer_to_device(optimizer, device)
 
     last_completed_epoch = start_epoch - 1
 
