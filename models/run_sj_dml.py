@@ -115,23 +115,17 @@ class KS32_FullySpiking_Small(nn.Module):
 
 
 def ensure_time_batch_first(x: torch.Tensor, T: int) -> torch.Tensor:
-    # Debug once if you want:
-    # print("ensure_time_batch_first got:", x.dim(), tuple(x.shape))
-
     if x.dim() == 5:
-        # [T,B,C,H,W] or [B,T,C,H,W]
         if x.shape[0] == T:
             return x
         if x.shape[1] == T:
             return x.permute(1, 0, 2, 3, 4).contiguous()
-        # If T doesn't match any dimension, assume it's already [T,B,C,H,W]
         return x
 
     if x.dim() == 4:
-        return x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+        return x.unsqueeze(0).expand(T, -1, -1, -1, -1).contiguous()
 
     raise RuntimeError(f"Unexpected x.dim={x.dim()} with shape {tuple(x.shape)}")
-
 
 
 def main():
