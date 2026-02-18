@@ -6,7 +6,7 @@ import torch_directml
 
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
-
+from spikingjelly.activation_based import surrogate
 from spikingjelly.activation_based import neuron, layer, functional
 
 
@@ -84,32 +84,57 @@ class KS32_FullySpiking_Small(nn.Module):
         x = self.fc(x)
         return x
 
-
 def main():
     device = torch_directml.device()
     print("Using DirectML device:", device)
 
-    tfm = transforms.Compose([transforms.ToTensor()])
-    train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=tfm)
-    test_ds  = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm)
+    # ===== FashionMNIST transforms =====
+    # FashionMNIST is 1-channel (grayscale). Your model expects 3 channels.
+    tfm_train = transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+
+    tfm_test = transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+
+    train_ds = datasets.FashionMNIST(root="./data", train=True, download=True, transform=tfm_train)
+    test_ds  = datasets.FashionMNIST(root="./data", train=False, download=True, transform=tfm_test)
 
     train_ld = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
     test_ld  = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0)
 
+    # ===== Spiking neuron (surrogate gradient is key) =====
     spk = neuron.LIFNode
+    spk_kwargs = dict(
+        tau=2.0,
+        v_threshold=0.5,
+        v_reset=0.0,
+        surrogate_function=surrogate.ATan(),
+        detach_reset=True,
+    )
 
     model = KS32_FullySpiking_Small(
         block=BasicBlock,
         num_block=[5, 5, 5],
         num_classes=10,
         spiking_neuron=spk,
-        tau=2.0,
-        v_threshold=1.0,
-        v_reset=0.0
+        **spk_kwargs
     ).to(device)
 
-    functional.set_step_mode(model, 's')
+    # ===== Multi-step setting =====
+    T = 8
+    functional.set_step_mode(model, 'm')
 
+    # ===== Optimizer (DirectML-friendly) =====
     opt = torch.optim.SGD(
         model.parameters(),
         lr=0.1,
@@ -117,19 +142,28 @@ def main():
         weight_decay=5e-4
     )
 
+    # Optional but helpful
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=10)
+
     crit = nn.CrossEntropyLoss()
 
-    for epoch in range(1, 6):
+    epochs = 10
+    for epoch in range(1, epochs + 1):
+        # ----- train -----
         model.train()
         correct = total = 0
 
-        for x, y in train_ld:
+        for i, (x, y) in enumerate(train_ld):
             x = x.to(device)
             y = y.to(device)
 
             functional.reset_net(model)
 
-            out = model(x)
+            # [B,C,H,W] -> [T,B,C,H,W]
+            x_seq = x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+            out_seq = model(x_seq)      # [T,B,10]
+            out = out_seq.mean(0)       # [B,10]
+
             loss = crit(out, y)
 
             opt.zero_grad()
@@ -140,16 +174,25 @@ def main():
             correct += (pred == y).sum().item()
             total += y.numel()
 
+            if i % 100 == 0:
+                print(f"Epoch {epoch} batch {i}/{len(train_ld)} loss {loss.item():.4f}")
+
         train_acc = correct / total
 
+        # ----- eval -----
         model.eval()
         correct = total = 0
         with torch.no_grad():
             for x, y in test_ld:
                 x = x.to(device)
                 y = y.to(device)
+
                 functional.reset_net(model)
-                out = model(x)
+
+                x_seq = x.unsqueeze(0).repeat(T, 1, 1, 1, 1)
+                out_seq = model(x_seq)
+                out = out_seq.mean(0)
+
                 pred = out.argmax(1)
                 correct += (pred == y).sum().item()
                 total += y.numel()
@@ -157,6 +200,7 @@ def main():
         test_acc = correct / total
         print(f"Epoch {epoch} | train_acc={train_acc:.4f} | test_acc={test_acc:.4f}")
 
+        scheduler.step()
 
 if __name__ == "__main__":
     main()
