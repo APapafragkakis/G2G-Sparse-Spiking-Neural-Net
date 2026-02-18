@@ -1,16 +1,3 @@
-# conv_edge_pruning.py
-# Channel-edge pruning for Conv2d layers (edges: input channel c -> output channel c')
-#
-# Implements:
-# 1) Pre-training pruning (random mask at init)
-# 2) Dynamic pruning during training (periodic prune lowest-importance active edges + random rewiring)
-# 3) Post-training pruning (prune low-importance edges + optional fine-tune outside this module)
-#
-# Assumptions:
-# - Edge importance is L1 norm of the kernel: importance(c->c') = ||K_{c',c}||_1
-# - Ablating an edge means removing the entire kernel W[c',c,:,:] via a binary mask
-# - Supports standard (dense) conv only: groups == 1
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,20 +7,7 @@ import torch
 import torch.nn as nn
 
 
-# -----------------------------
-# Masked conv wrapper
-# -----------------------------
-
 class ChannelMaskedConv2d(nn.Module):
-    """
-    Wraps nn.Conv2d and applies a channel-edge mask of shape [C_out, C_in].
-
-    Effective weight:
-        W_eff = W * mask[:, :, None, None]
-
-    Notes:
-    - Supports groups == 1 only.
-    """
     def __init__(self, conv: nn.Conv2d):
         super().__init__()
         if not isinstance(conv, nn.Conv2d):
@@ -68,11 +42,6 @@ class ChannelMaskedConv2d(nn.Module):
         total = self.mask.numel()
         return f"masked_edges={active}/{total} | sparsity={1 - active/total:.2%}"
 
-
-# -----------------------------
-# Utilities
-# -----------------------------
-
 def iter_masked_convs(model: nn.Module) -> Iterable[Tuple[str, ChannelMaskedConv2d]]:
     for name, m in model.named_modules():
         if isinstance(m, ChannelMaskedConv2d):
@@ -84,9 +53,6 @@ def wrap_conv2d_with_edge_masks_(
     *,
     include_names: Optional[List[str]] = None
 ) -> nn.Module:
-    """
-    In-place replacement of nn.Conv2d with ChannelMaskedConv2d.
-    """
     def should_wrap(full_name: str, module: nn.Module) -> bool:
         if not isinstance(module, nn.Conv2d):
             return False
@@ -103,16 +69,8 @@ def wrap_conv2d_with_edge_masks_(
                 setattr(parent, child_name, ChannelMaskedConv2d(child))
     return model
 
-
-# -----------------------------
-# Core pruning logic
-# -----------------------------
-
 @torch.no_grad()
 def init_random_sparsity_(layer: ChannelMaskedConv2d, sparsity: float) -> None:
-    """
-    Pre-training pruning: randomly deactivate a fixed percentage of edges.
-    """
     if not (0.0 <= sparsity < 1.0):
         raise ValueError("sparsity must be in [0,1)")
 
@@ -129,17 +87,11 @@ def init_random_sparsity_(layer: ChannelMaskedConv2d, sparsity: float) -> None:
 
 @torch.no_grad()
 def edge_importance_l1(layer: ChannelMaskedConv2d) -> torch.Tensor:
-    """
-    importance(c -> c') = ||K_{c',c}||_1
-    """
     return layer.weight.abs().sum(dim=(2, 3))
 
 
 @torch.no_grad()
 def prune_low_importance_active_(layer: ChannelMaskedConv2d, prune_frac: float) -> int:
-    """
-    Prune lowest-importance ACTIVE edges.
-    """
     if prune_frac <= 0:
         return 0
 
@@ -167,9 +119,6 @@ def prune_low_importance_active_(layer: ChannelMaskedConv2d, prune_frac: float) 
 
 @torch.no_grad()
 def rewire_random_inactive_(layer: ChannelMaskedConv2d, num_to_grow: int) -> int:
-    """
-    Randomly activate inactive edges.
-    """
     if num_to_grow <= 0:
         return 0
 
@@ -187,17 +136,9 @@ def rewire_random_inactive_(layer: ChannelMaskedConv2d, num_to_grow: int) -> int
 
 @torch.no_grad()
 def dynamic_prune_and_rewire_(layer: ChannelMaskedConv2d, prune_frac: float) -> Dict[str, int]:
-    """
-    Prune + rewire while keeping sparsity constant.
-    """
     pruned = prune_low_importance_active_(layer, prune_frac)
     grown = rewire_random_inactive_(layer, pruned)
     return {"pruned": pruned, "grown": grown}
-
-
-# -----------------------------
-# Model-level APIs
-# -----------------------------
 
 @dataclass
 class SparsityStats:
