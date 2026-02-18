@@ -4,9 +4,7 @@ import csv
 from glob import glob
 from collections import defaultdict
 
-LOGDIRS = [
-    r"folder",
-]
+LOGDIRS = [r"C:\Users\User\Desktop\ICS-FORTH\G2G-Sparse-Spiking-Neural-Net\logs_resnet_cifar100_T50_bs256_e20_static_sparseh512_densecapmatch_D256_plus_dense512_pgrid"]
 
 RE_P = re.compile(r"_p(?P<p>\d+(?:[._]\d+)?)_", re.IGNORECASE)
 
