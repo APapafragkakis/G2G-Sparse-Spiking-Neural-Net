@@ -716,8 +716,6 @@ def parse_args():
                    help="Post-training pruning fraction of ACTIVE edges to prune after training. (0.0 disables)")
     p.add_argument("--conv_finetune_epochs", type=int, default=0,
                    help="Extra epochs to fine-tune after post-training pruning.")
-    p.add_argument("--conv_seed", type=int, default=123,
-                   help="Seed for conv pruning randomness (init + rewiring).")
     return p.parse_args()
 
 
